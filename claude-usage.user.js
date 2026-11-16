@@ -1,0 +1,997 @@
+// ==UserScript==
+// @name         Claude.ai Usage & Context Overlay (DOM Sync v2.2)
+// @namespace    https://github.com/wojtulab/claude-code-usage
+// @version      2.11.1
+// @description  Monitor Claude.ai 1M context and 5h/7d usage limits, sound/browser alerts before & after reset or response completion, and auto-click "Try again".
+// @homepageURL  https://github.com/wojtulab/claude-code-usage
+// @supportURL   https://github.com/wojtulab/claude-code-usage/issues
+// @updateURL    https://raw.githubusercontent.com/wojtulab/claude-code-usage/main/claude-usage.user.js
+// @downloadURL  https://raw.githubusercontent.com/wojtulab/claude-code-usage/main/claude-usage.user.js
+// @match        https://claude.ai/*
+// @match        https://*.claude.ai/*
+// @grant        none
+// @license      MIT
+// ==/UserScript==
+
+(function () {
+  'use strict';
+
+  const TICK_INTERVAL_MS = 1000;             // Countdown, alerts, and button checks every 1s
+
+  // Settings: ⚙ panel in overlay header, saved to localStorage (claude_overlay_cfg_v1). CFG_SCHEMA entries: [key, label, type, default].
+  const CFG_SCHEMA = [
+    ['threshold', 'Context warning threshold (%)', 'num', 80],
+    ['refreshSec', 'API refresh interval (s)', 'num', 10],
+    ['soundContext', 'Sound: context ≥ threshold / quota forecast', 'bool', true],
+    ['soundPre', 'Sound: 1 minute before reset', 'bool', true],
+    ['soundReset', 'Sound: session recovered', 'bool', true],
+    ['doneSound', 'Response ready: sound', 'bool', true],
+    ['doneNotify', 'Response ready: browser notification', 'bool', true],
+    ['doneMinSec', 'Response ready: min generation time (s)', 'num', 10],
+    ['fcMin', 'Forecast: alert if limit ends within (min, 0 = off)', 'num', 30],
+    ['sessList', 'Session list in overlay (claude.ai/code)', 'bool', true],
+    ['titleInfo', 'Tab title: busy state and session %', 'bool', true],
+    ['titleBlink', 'Response ready: blink ✅ in title + green icon (silent)', 'bool', true],
+    ['hiddenOnly', 'Notifications only when tab is in background', 'bool', true],
+    ['opacityIdle', 'Opacity (%)', 'num', 50],
+    ['opacityHover', 'Opacity on hover (%)', 'num', 90]
+  ];
+  const cfg = Object.fromEntries(CFG_SCHEMA.map((s) => [s[0], s[3]]));
+  try { Object.assign(cfg, JSON.parse(localStorage.getItem('claude_overlay_cfg_v1')) || {}); } catch (e) {}
+
+  function applyCfg() {
+    let st = document.getElementById('claude-usage-overlay-cfgstyle');
+    if (!st) { st = document.createElement('style'); st.id = 'claude-usage-overlay-cfgstyle'; document.head.appendChild(st); }
+    st.textContent = `#claude-usage-overlay{opacity:${cfg.opacityIdle / 100} !important}#claude-usage-overlay:hover{opacity:${cfg.opacityHover / 100} !important}`;
+  }
+
+  function openSettings() {
+    const old = document.getElementById('claude-usage-overlay-cfg');
+    if (old) { old.remove(); return; }
+    const ov = document.getElementById('claude-usage-overlay');
+    const r = ov ? ov.getBoundingClientRect() : { left: innerWidth - 16, bottom: innerHeight - 80 };
+    const p = document.createElement('div');
+    p.id = 'claude-usage-overlay-cfg';
+    p.style.cssText = 'position:fixed;z-index:2147483647;background:#1e1e1e;color:#e0e0e0;border:1px solid #777;border-radius:8px;padding:10px 12px;font:12px sans-serif;box-shadow:0 4px 16px rgba(0,0,0,.6);min-width:240px;' +
+      'right:' + Math.max(8, innerWidth - r.left + 8) + 'px;bottom:' + Math.max(8, innerHeight - r.bottom) + 'px;';
+    const h = document.createElement('div');
+    h.textContent = '⚙ Claude Settings';
+    h.style.cssText = 'font-weight:bold;margin-bottom:8px;border-bottom:1px solid #333;padding-bottom:4px;';
+    p.appendChild(h);
+    CFG_SCHEMA.forEach(([k, label, type]) => {
+      const row = document.createElement('label');
+      row.style.cssText = 'display:flex;justify-content:space-between;align-items:center;gap:10px;margin:4px 0;cursor:pointer;';
+      const t = document.createElement('span'); t.textContent = label;
+      const i = document.createElement('input');
+      i.type = type === 'bool' ? 'checkbox' : 'number';
+      if (type === 'bool') i.checked = !!cfg[k]; else { i.value = cfg[k]; i.style.width = '56px'; }
+      i.onchange = () => {
+        const n = parseFloat(i.value); // 0 is a valid value
+        cfg[k] = type === 'bool' ? i.checked : (Number.isFinite(n) && n >= 0 ? n : CFG_SCHEMA.find((s) => s[0] === k)[3]);
+        if (type === 'bool' && i.checked && /Notify$/.test(k)) askNotifyPermission();
+        try { localStorage.setItem('claude_overlay_cfg_v1', JSON.stringify(cfg)); } catch (e) {}
+        applyCfg();
+      };
+      row.append(t, i);
+      p.appendChild(row);
+    });
+    const x = document.createElement('div');
+    x.textContent = 'Refresh/threshold changes apply immediately; settings are stored per browser.';
+    x.style.cssText = 'font-size:9px;color:#777;margin-top:6px;';
+    p.appendChild(x);
+    p.addEventListener('click', (e) => e.stopPropagation());
+    document.body.appendChild(p);
+  }
+
+  let cachedOrgId = localStorage.getItem('claude_overlay_org_id') || null;
+  let alertedContext = false;
+
+  // Remember reset timestamps for which sounds were already played (prevents duplicates after F5)
+  let lastPreResetSoundTs = Number(localStorage.getItem('claude_overlay_pre_sound_ts')) || 0;
+  let lastResetSoundTs = Number(localStorage.getItem('claude_overlay_reset_sound_ts')) || 0;
+
+  // "Try again" click tracking
+  let lastTryAgainClickTime = 0;
+  let tryAgainAttemptsForCycle = 0;
+  let lastClickedCycleTs = 0;
+
+  let state = {
+    sessionPct: '?',
+    weeklyPct: '?',
+    sessionResetTs: null,
+    weeklyResetTs: null,
+    contextText: '?',
+    contextPct: 0,
+    hasContextUI: false,
+    lastUpdated: null,
+    error: false,
+    autoTryAgain: localStorage.getItem('claude_overlay_auto_try_again') !== 'false', // enabled by default
+    statusNote: ''
+  };
+
+  function injectStyles() {
+    if (document.getElementById('claude-overlay-styles')) return;
+    const style = document.createElement('style');
+    style.id = 'claude-overlay-styles';
+    style.textContent = `
+      @keyframes claudePulseRed {
+        0% { box-shadow: 0 0 0 0 rgba(244, 67, 54, 0.7), 0 4px 12px rgba(0,0,0,0.5); border-color: #f44336; }
+        70% { box-shadow: 0 0 0 10px rgba(244, 67, 54, 0), 0 4px 12px rgba(0,0,0,0.5); border-color: #ff7961; }
+        100% { box-shadow: 0 0 0 0 rgba(244, 67, 54, 0), 0 4px 12px rgba(0,0,0,0.5); border-color: #f44336; }
+      }
+      .claude-overlay-critical {
+        animation: claudePulseRed 2s infinite !important;
+        background: #2a1215 !important;
+      }
+    `;
+    document.head.appendChild(style);
+  }
+
+  const esc = (t) => String(t == null ? '' : t).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+
+  // Notification permission may only be requested from a user gesture (click on overlay/⚙/checkbox), never from a timer.
+  function askNotifyPermission() {
+    try { if ('Notification' in window && Notification.permission === 'default') Notification.requestPermission(); } catch (e) {}
+  }
+  // Colored dot in favicon during alert (static, no timer so not throttled in background).
+  // Shared blocks with antigravity-quota.user.js (change in one = change in both): setFav, away, notify, closeN, claimOnce, audio.
+  let favOrig = null, favMade = false, favColor = '';
+  function setFav(color) {
+    let l = document.querySelector('link[rel~="icon"]');
+    if (color) {
+      if (favOrig === null) {
+        if (!l) { l = document.createElement('link'); l.rel = 'icon'; document.head.appendChild(l); favMade = true; }
+        favOrig = l.href || '';
+      }
+      if (favColor === color && l && l.href.startsWith('data:')) return;
+      favColor = color;
+      l.href = `data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Ccircle cx='8' cy='8' r='7' fill='${encodeURIComponent(color)}'/%3E%3C/svg%3E`;
+    } else if (favOrig !== null) {
+      if (l) { if (favMade) l.remove(); else l.href = favOrig; }
+      favOrig = null; favMade = false; favColor = '';
+    }
+  }
+  const away = () => document.hidden || !document.hasFocus(); // background tab OR unfocused window (second monitor)
+  const openNs = new Set(); // open sticky notifications; closeN closes all of them
+  function closeN() { openNs.forEach((n) => { try { n.close(); } catch (e) {} }); openNs.clear(); }
+  function notify(title, body, tag, force, sticky, onClick) {
+    if (cfg.hiddenOnly && !away() && !force) return;
+    try {
+      if ('Notification' in window && Notification.permission === 'granted') {
+        const n = new Notification(title, { body, tag, requireInteraction: !!sticky });
+        if (sticky) openNs.add(n);
+        n.onclick = () => { window.focus(); try { if (onClick) onClick(); } catch (e) {} n.close(); openNs.delete(n); };
+      }
+    } catch (e) {}
+  }
+
+  // Single shared AudioContext (previously created on every beep).
+  let actx = null;
+  function ensureAudio() {
+    try {
+      const AudioCtx = window.AudioContext || window.webkitAudioContext;
+      if (!AudioCtx) return null;
+      if (!actx) { actx = new AudioCtx(); actx.onstatechange = () => diag('audio:' + actx.state); }
+      if (actx.state !== 'running') actx.resume().catch(() => {});
+      return actx;
+    } catch (e) { return null; }
+  }
+  // Unlock audio on first user gesture (autoplay policy) so background-tab alerts do not wait until tab return.
+  ['pointerdown', 'keydown'].forEach((ev) => window.addEventListener(ev, ensureAudio, true));
+
+  // Diagnostic log: last 120 events in localStorage, read via `__claudeDiag()` in claude.ai console.
+  // i = tab (random id), h = background tab, a = AudioContext state, n = Notification permission.
+  const DIAG_KEY = 'claude_overlay_diag_v1', TAB_ID = Math.random().toString(36).slice(2, 5);
+  // Multi-tab coordination: only the tab that wins the claim sends the alert for an event. Write TAB_ID+time to localStorage,
+  // read back after ~50 ms (last write visible to all tabs wins); key fresher than ttlMs held by another tab → false.
+  // Shared block with antigravity-quota.user.js: change in one = change in both.
+  function claimOnce(key, ttlMs) {
+    const k = 'ide_claim_' + key;
+    try {
+      const cur = JSON.parse(localStorage.getItem(k) || 'null');
+      if (cur && cur.id !== TAB_ID && Date.now() - cur.t < ttlMs) return Promise.resolve(false);
+      localStorage.setItem(k, JSON.stringify({ id: TAB_ID, t: Date.now() }));
+    } catch (e) { return Promise.resolve(true); }
+    return new Promise((res) => setTimeout(() => {
+      try { const c = JSON.parse(localStorage.getItem(k) || 'null'); res(!c || c.id === TAB_ID); } catch (e) { res(true); }
+    }, 50));
+  }
+  function diag(k, extra) {
+    try {
+      const a = JSON.parse(localStorage.getItem(DIAG_KEY) || '[]');
+      a.push(Object.assign({ t: new Date().toTimeString().slice(0, 8), i: TAB_ID, k, h: document.hidden ? 1 : 0, a: actx ? actx.state : '-', n: 'Notification' in window ? Notification.permission : '-' }, extra));
+      localStorage.setItem(DIAG_KEY, JSON.stringify(a.slice(-120)));
+    } catch (e) {}
+  }
+  window.__claudeDiag = () => { try { const a = JSON.parse(localStorage.getItem(DIAG_KEY) || '[]'); console.table(a); return a; } catch (e) { return []; } };
+
+  // Generic Web Audio API tone sequence player
+  function playTones(notes) {
+    const ctx = ensureAudio();
+    if (!ctx) return;
+    const t0 = Date.now();
+    const go = () => {
+      if (Date.now() - t0 > 1500) { diag('beep-stale'); return; } // blocked AudioContext resumed only on tab return: stale beep is worse than silence
+      try {
+        notes.forEach(({ freq, start, duration, type = 'sine', gainVal = 0.09 }) => {
+          const osc = ctx.createOscillator();
+          const gain = ctx.createGain();
+          osc.type = type;
+          osc.frequency.setValueAtTime(freq, ctx.currentTime + start);
+          gain.gain.setValueAtTime(gainVal, ctx.currentTime + start);
+          gain.gain.exponentialRampToValueAtTime(0.001, ctx.currentTime + start + duration);
+          osc.connect(gain);
+          gain.connect(ctx.destination);
+          osc.start(ctx.currentTime + start);
+          osc.stop(ctx.currentTime + start + duration);
+        });
+      } catch (e) {}
+    };
+    if (ctx.state === 'running') go(); else ctx.resume().then(go, () => diag('beep-blocked'));
+  }
+
+  // 1. Context full warning (>= 80%)
+  function playContextAlertBeep() {
+    playTones([
+      { freq: 880, start: 0, duration: 0.15 },
+      { freq: 1174.66, start: 0.18, duration: 0.25 }
+    ]);
+  }
+
+  // 2. Notification 1 minute before session reset (gentle double chime)
+  function playPreResetBeep() {
+    playTones([
+      { freq: 587.33, start: 0, duration: 0.16, type: 'triangle', gainVal: 0.11 },    // D5
+      { freq: 880.00, start: 0.20, duration: 0.28, type: 'triangle', gainVal: 0.11 }  // A5
+    ]);
+  }
+
+  // 3. Notification when session recovers (distinct ascending chord)
+  function playSessionResetBeep() {
+    playTones([
+      { freq: 523.25, start: 0, duration: 0.14, type: 'triangle', gainVal: 0.12 },    // C5
+      { freq: 659.25, start: 0.15, duration: 0.14, type: 'triangle', gainVal: 0.12 }, // E5
+      { freq: 783.99, start: 0.30, duration: 0.14, type: 'triangle', gainVal: 0.12 }, // G5
+      { freq: 1046.50, start: 0.45, duration: 0.35, type: 'triangle', gainVal: 0.13 } // C6
+    ]);
+  }
+
+  // Response ready: short two-tone chime distinct from limit alerts
+  function playDoneBeep() {
+    playTones([
+      { freq: 698.46, start: 0, duration: 0.12, type: 'triangle', gainVal: 0.1 },    // F5
+      { freq: 1046.50, start: 0.14, duration: 0.22, type: 'triangle', gainVal: 0.1 } // C6
+    ]);
+  }
+
+  function formatResetTime(ts, showSeconds = false) {
+    if (!ts) return 'No data';
+    try {
+      const date = new Date(ts);
+      const diffMs = ts - Date.now();
+      let diffStr = '';
+      if (diffMs > 0) {
+        const hrs = Math.floor(diffMs / 3600000);
+        const mins = Math.floor((diffMs % 3600000) / 60000);
+        const secs = Math.floor((diffMs % 60000) / 1000);
+        if (hrs > 0) {
+          diffStr = `in ${hrs}h ${mins}m`;
+        } else if (showSeconds) {
+          diffStr = `in ${mins}m ${secs}s`;
+        } else {
+          diffStr = `in ${mins}m`;
+        }
+      }
+      const timeStr = date.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+      return diffStr ? `Reset: ${timeStr} (${diffStr})` : `Reset: ${timeStr}`;
+    } catch (e) {
+      return 'No data';
+    }
+  }
+
+  async function getOrgId() {
+    if (cachedOrgId) return cachedOrgId;
+    const orgsRes = await fetch('/api/organizations', {
+      credentials: 'same-origin',
+      headers: { 'accept': 'application/json' }
+    });
+    if (orgsRes.status === 429 || orgsRes.status === 401) throw Object.assign(new Error(`HTTP Org Error: ${orgsRes.status}`), { backoff: true });
+    if (!orgsRes.ok) throw new Error(`HTTP Org Error: ${orgsRes.status}`);
+    const orgs = await orgsRes.json();
+    if (!orgs || !orgs.length) throw new Error('No organization found');
+    cachedOrgId = orgs[0].uuid || orgs[0].id;
+    localStorage.setItem('claude_overlay_org_id', cachedOrgId);
+    return cachedOrgId;
+  }
+
+  async function fetchUsageFromApi() {
+    const orgId = await getOrgId();
+    const usageRes = await fetch(`/api/organizations/${orgId}/usage`, {
+      credentials: 'same-origin',
+      headers: { 'accept': 'application/json' }
+    });
+
+    if (usageRes.status === 403 || usageRes.status === 404) {
+      cachedOrgId = null;
+      localStorage.removeItem('claude_overlay_org_id');
+      throw new Error('Expired org ID');
+    }
+    if (usageRes.status === 429 || usageRes.status === 401) throw Object.assign(new Error(`HTTP Usage Error: ${usageRes.status}`), { backoff: true });
+    if (!usageRes.ok) throw new Error(`HTTP Usage Error: ${usageRes.status}`);
+
+    const data = await usageRes.json();
+
+    const sessionPct = data.five_hour?.utilization != null
+      ? Math.round(data.five_hour.utilization)
+      : '?';
+    const sessionResetTs = data.five_hour?.resets_at
+      ? new Date(data.five_hour.resets_at).getTime()
+      : null;
+
+    const weeklyPct = data.seven_day?.utilization != null
+      ? Math.round(data.seven_day.utilization)
+      : (data.weekly_all?.utilization != null ? Math.round(data.weekly_all.utilization) : '?');
+    const weeklyRaw = data.seven_day?.resets_at || data.weekly_all?.resets_at;
+    const weeklyResetTs = weeklyRaw ? new Date(weeklyRaw).getTime() : null;
+
+    return { sessionPct, weeklyPct, sessionResetTs, weeklyResetTs };
+  }
+
+  // TreeWalker over text nodes (instead of reading textContent on every element): candidates are short nodes with "used"/"1M",
+  // exact match is checked against parent text (up to 3 levels up), skipping our own overlay.
+  function scrapeContextFromDOM() {
+    let pctVal = null;
+    let ratioText = '';
+
+    const tw = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);
+    for (let n = tw.nextNode(); n; n = tw.nextNode()) {
+      const v = n.nodeValue;
+      if (!v || v.length > 60 || !/used|1M/i.test(v)) continue;
+      if (n.parentElement && n.parentElement.closest('#claude-usage-overlay')) continue;
+      for (let el = n.parentElement, i = 0; el && i < 3; el = el.parentElement, i++) {
+        const t = (el.textContent || '').trim();
+        if (/^\d{1,3}%\s+used$/i.test(t)) { pctVal = parseInt(t, 10); break; }
+        if (/\/\s*1M/i.test(t) && t.length < 30) { ratioText = t; break; }
+      }
+    }
+
+    if (pctVal !== null) {
+      if (pctVal >= cfg.threshold && !alertedContext) {
+        alertedContext = true;
+        if (cfg.soundContext) playContextAlertBeep();
+      } else if (pctVal < cfg.threshold) {
+        alertedContext = false;
+      }
+
+      return {
+        hasContextUI: true,
+        contextPct: pctVal,
+        contextText: ratioText || `${pctVal}% / 1M`
+      };
+    }
+
+    return { hasContextUI: false, contextPct: 0, contextText: 'No panel' };
+  }
+
+  // Finds the limit card and "Try again" button regardless of dynamic React IDs:
+  // walks up from the button to the largest ancestor (<500 chars) containing "limit reached" (instead of scanning all divs).
+  function findLimitCardAndTryAgainBtn() {
+    for (const btn of document.querySelectorAll('button')) {
+      if (btn.disabled || !/^Try again$/i.test(btn.textContent.trim())) continue;
+      let found = null;
+      for (let card = btn.parentElement, i = 0; card && i < 10; card = card.parentElement, i++) {
+        const txt = card.textContent || '';
+        if (txt.length >= 500) break;
+        if (/limit reached/i.test(txt)) found = { card, btn, text: txt };
+      }
+      if (found) return found;
+    }
+    return null;
+  }
+
+  // Fallback reset-time parsing from card text e.g. "Auto-resuming at 1:01 PM" if the API failed
+  function parseFallbackResetTsFromText(text) {
+    const m = text.match(/Auto-resuming at\s+(\d{1,2}):(\d{2})\s*(AM|PM)?/i);
+    if (!m) return null;
+    let hours = parseInt(m[1], 10);
+    const mins = parseInt(m[2], 10);
+    const ampm = m[3] ? m[3].toUpperCase() : null;
+
+    if (ampm === 'PM' && hours < 12) hours += 12;
+    if (ampm === 'AM' && hours === 12) hours = 0;
+
+    const now = new Date();
+    const target = new Date(now.getFullYear(), now.getMonth(), now.getDate(), hours, mins, 0, 0);
+    if (target.getTime() < now.getTime() - 12 * 3600 * 1000) {
+      target.setDate(target.getDate() + 1);
+    }
+    return target.getTime();
+  }
+
+  // Tab title: "🔄 41% · Claude Code" (busy), "✅3 🔄2 41% · …" (done/busy counters), "41% · …" (idle).
+  // % = 5h session usage. Strip prefix before re-applying so page title updates don't loop.
+  const TITLE_PREFIX_RE = /^(?:✅\d*\s+)?(?:🔄\d*\s+)?(?:\d{1,3}% · )?/;
+  let titleDone = false;
+  function isCurrentWorking() {
+    if (genSince && !genIdleAt) return true;
+    for (const rec of rowBusy.values()) if (rec.current && !rec.idleAt) return true;
+    return false;
+  }
+  function busyCount() {
+    let n = 0, cur = false;
+    for (const rec of rowBusy.values()) if (!rec.idleAt) { n++; if (rec.current) cur = true; }
+    if (genSince && !genIdleAt && !cur) n++;
+    return n;
+  }
+  function markDone() { if (away()) titleDone = true; }
+  function clearDone() {
+    if (away()) return;
+    closeN();
+    document.querySelectorAll('[data-row-key]').forEach((r) => {
+      if (r.querySelector('[aria-current="page"]')) rowDone.delete(r.getAttribute('data-row-key'));
+    });
+    titleDone = false;
+    applyTitle();
+  }
+  // ✅ blinking and favicon are independent of 🔄/% prefix (titleInfo); ticked by applyTitle called every 1s from renderOverlay.
+  function applyTitle() {
+    if (isCurrentWorking()) titleDone = false;
+    setFav(titleDone && cfg.titleBlink ? '#22c55e' : '');
+    const base = document.title.replace(TITLE_PREFIX_RE, '');
+    let next = base;
+    const blinkHide = titleDone && cfg.titleBlink && (Math.floor(Date.now() / 1000) % 2 === 1);
+    const doneN = Math.max(rowDone.size, titleDone ? 1 : 0);
+    const busyN = busyCount();
+    if (cfg.titleInfo) {
+      const donePart = doneN && !blinkHide ? '✅' + (doneN > 1 ? doneN : '') + ' ' : '';
+      const busyPart = busyN ? '🔄' + (busyN > 1 ? busyN : '') + ' ' : '';
+      const pct = /^\d+$/.test(String(state.sessionPct)) ? state.sessionPct + '% · ' : '';
+      next = donePart + busyPart + pct + base;
+    } else if (cfg.titleBlink && titleDone && !blinkHide) {
+      next = '✅ ' + base;
+    }
+    if (document.title !== next) document.title = next;
+  }
+
+  // Quota exhaustion forecast: "remaining %" (100 - used) history in localStorage, burn rate window (5h: 45 min, weekly: 6h).
+  // Remaining % increase = window reset → clear history. Heartbeat every 5 min, so idle gaps dilute burn rate.
+  const FC_WIN = { session: 45 * 60e3, weekly: 6 * 3600e3 };
+  let hist = {};
+  try { hist = JSON.parse(localStorage.getItem('claude_overlay_hist_v1')) || {}; } catch (e) {}
+  function recordHist(kind, pct) {
+    if (!/^\d+$/.test(String(pct))) return;
+    const v = 100 - Number(pct), now = Date.now();
+    // Another tab may have appended points: storage is a superset of memory (we write after every change), so reload before editing.
+    try { const d = JSON.parse(localStorage.getItem('claude_overlay_hist_v1')); if (d && typeof d === 'object') hist = d; } catch (e) {}
+    const h = hist[kind] || (hist[kind] = []);
+    const last = h[h.length - 1];
+    if (last && v > last.v) h.length = 0;
+    if (!h.length || v !== h[h.length - 1].v || now - h[h.length - 1].t > 300000) h.push({ t: now, v });
+    while (h.length && now - h[0].t > 7 * 3600e3) h.shift();
+    try { localStorage.setItem('claude_overlay_hist_v1', JSON.stringify(hist)); } catch (e) {}
+  }
+  function forecast(kind) {
+    const now = Date.now(), pts = (hist[kind] || []).filter((p) => now - p.t <= FC_WIN[kind]);
+    if (pts.length < 2) return null;
+    const a = pts[0], b = pts[pts.length - 1], drop = a.v - b.v, dt = (b.t - a.t) / 3600e3;
+    if (drop < 2 || dt < 3 / 60) return null; // too little change (1% rounding) or measurement window too short
+    const rate = drop / dt, etaMs = (b.v / rate) * 3600e3 - (now - b.t);
+    const resetTs = state[kind + 'ResetTs'];
+    return { rate, etaMs: Math.max(0, etaMs), before: !!resetTs && etaMs < resetTs - now };
+  }
+  function fmtDur(ms) {
+    const m = Math.round(ms / 60000);
+    if (m < 1) return '<1m';
+    if (m < 60) return m + 'm';
+    if (m < 2880) return Math.floor(m / 60) + 'h ' + (m % 60) + 'm';
+    return Math.floor(m / 1440) + 'd';
+  }
+  function fcHtml(kind) {
+    const f = forecast(kind);
+    if (!f) return '';
+    const txt = f.before ? `⏱ ${f.rate.toFixed(1)}%/h → limit in ~${fmtDur(f.etaMs)} ⚠ before reset` : `⏱ ${f.rate.toFixed(1)}%/h · lasts until reset`;
+    return `<div style="font-size:10px;color:${f.before ? '#ff8a80' : '#888'};margin:-4px 0 6px">${txt}</div>`;
+  }
+  let fcAlerted = {};
+  try { fcAlerted = JSON.parse(localStorage.getItem('claude_overlay_fc_v1')) || {}; } catch (e) {}
+  // Another tab played/marked an alert → refresh flags instead of reading once on startup.
+  window.addEventListener('storage', (e) => {
+    try {
+      if (e.key === 'claude_overlay_pre_sound_ts') lastPreResetSoundTs = Number(e.newValue) || 0;
+      else if (e.key === 'claude_overlay_reset_sound_ts') lastResetSoundTs = Number(e.newValue) || 0;
+      else if (e.key === 'claude_overlay_fc_v1') fcAlerted = JSON.parse(e.newValue) || {};
+    } catch (err) {}
+  });
+  function checkForecast() {
+    if (!cfg.fcMin) return;
+    [['session', 'Session 5h'], ['weekly', 'Weekly']].forEach(([kind, label]) => {
+      const f = forecast(kind), rts = state[kind + 'ResetTs'];
+      if (!f || !f.before || f.etaMs > cfg.fcMin * 60e3 || fcAlerted[kind] === rts) return;
+      try { fcAlerted = Object.assign(JSON.parse(localStorage.getItem('claude_overlay_fc_v1')) || {}, { [kind]: rts }); } catch (e) { fcAlerted[kind] = rts; } // once per reset window
+      try { localStorage.setItem('claude_overlay_fc_v1', JSON.stringify(fcAlerted)); } catch (e) {}
+      const body = `${label}: ~${fmtDur(f.etaMs)} left at ${f.rate.toFixed(1)}%/h (resets in ${fmtDur(rts - Date.now())})`;
+      claimOnce('fc-' + kind + '-' + rts, 600000).then((ok) => {
+        if (!ok) { diag('claim-lost', { k: 'fc' }); return; }
+        if (cfg.soundContext) playContextAlertBeep();
+        notify('Claude: limit running out', body, 'claude-fc-' + kind);
+      });
+    });
+  }
+
+  function openSession(key) {
+    if (!key) return;
+    const row = [...document.querySelectorAll('[data-row-key]')].find((r) => r.getAttribute('data-row-key') === key);
+    const a = row && (row.querySelector('a[data-row-main-button]') || row.querySelector('a[href]'));
+    if (a) a.click();
+    rowDone.delete(key);
+  }
+
+  // Shared "done" alert; Stop button and sidebar session spinner detectors won't duplicate it within 5s.
+  let lastDone = { tag: '', at: 0 };
+  function alertDone(title, tag, force, sessKey) {
+    const now = Date.now();
+    // same completion seen by both detectors (tag "claude-done" = Stop); distinct sessions don't block each other
+    if (now - lastDone.at < 5000 && (lastDone.tag === tag || lastDone.tag === 'claude-done' || tag === 'claude-done')) return;
+    lastDone = { tag, at: now };
+    diag('alert', { tag: String(tag).slice(-14), f: force ? 1 : 0 });
+    claimOnce('done-' + tag + '-' + title, 10000).then((ok) => {
+      if (!ok) { diag('claim-lost', { k: 'done' }); return; }
+      if (cfg.doneSound) playDoneBeep();
+      if (cfg.doneNotify) notify('Claude responded', title, tag, force, true, sessKey ? () => { openSession(sessKey); applyTitle(); } : null);
+    });
+  }
+
+  // Response ready (open chat): "Stop response" button (or data-is-streaming) disappears for >=2s.
+  let genSince = 0, genIdleAt = 0;
+  function detectResponseDone() {
+    const now = Date.now();
+    const stopBtn = document.querySelector('button[aria-label^="Stop" i], [data-is-streaming="true"]');
+    if (stopBtn) {
+      if (!genSince) { genSince = now; diag('stop+'); }
+      genIdleAt = 0;
+      return;
+    }
+    if (!genSince) return;
+    if (!genIdleAt) { genIdleAt = now; diag('stop-'); }
+    if (now - genIdleAt < 2000) return;
+    const dur = now - genSince;
+    genSince = 0; genIdleAt = 0;
+    markDone();
+    if (dur < cfg.doneMinSec * 1000) { diag('too-short', { s: Math.round(dur / 1000) }); return; }
+    alertDone(document.title.replace(/\s*[-–|]\s*Claude\s*$/i, ''), 'claude-done');
+  }
+
+  // Sidebar sessions (claude.ai/code): active `[data-row-key]` row has a dot in `[data-row-decoration]`:
+  // `<span role="img" aria-label="Running"><span data-cds="Pulse">` (CSS animation dframe-dot-blink; also on the active row).
+  // Indicator gone for >=2s → "done".
+  const BUSY_SEL = '[data-cds="Pulse"], [aria-label="Running"]';
+  // Active visible session → sound only; another session → notification even when the tab is visible.
+  const rowBusy = new Map(); // data-row-key → { since, idleAt, seen, title, current }
+  const rowDone = new Map(); // data-row-key → { title, at }: finished but not yet visited
+  function rowLabel(row) {
+    const el = row.querySelector('[data-row-label] [dir="auto"]') || row.querySelector('[data-row-label]');
+    if (!el) return row.getAttribute('data-row-key') || '';
+    const c = el.cloneNode(true);
+    c.querySelectorAll('.sr-only').forEach((n) => n.remove());
+    return (c.textContent || '').trim();
+  }
+  function detectRowsDone() {
+    const now = Date.now();
+    document.querySelectorAll('[data-row-key]').forEach((row) => {
+      const key = row.getAttribute('data-row-key');
+      let rec = rowBusy.get(key);
+      if (!away() && row.querySelector('[aria-current="page"]')) rowDone.delete(key); // session visited
+      if (row.querySelector(BUSY_SEL)) {
+        rowDone.delete(key);
+        if (!rec) { rowBusy.set(key, rec = { since: now, idleAt: 0, seen: now, title: '', current: false }); diag('spin+', { r: key.slice(-6) }); }
+        rec.idleAt = 0; rec.seen = now; rec.title = rowLabel(row); rec.current = !!row.querySelector('[aria-current="page"]');
+        return;
+      }
+      if (!rec) return;
+      rec.seen = now;
+      if (!rec.idleAt) { rec.idleAt = now; diag('spin-', { r: key.slice(-6) }); }
+      if (now - rec.idleAt < 2000) return;
+      rowBusy.delete(key);
+      if (!(rec.current && !away())) rowDone.set(key, { title: rec.title, at: now });
+      if (rec.current) markDone();
+      if (now - rec.since < cfg.doneMinSec * 1000) { diag('too-short', { s: Math.round((now - rec.since) / 1000) }); return; }
+      alertDone(rec.title, 'claude-row-' + key, !rec.current, key);
+    });
+    rowBusy.forEach((rec, k) => { if (now - rec.seen > 30000) rowBusy.delete(k); }); // row vanished (re-render)
+    rowDone.forEach((d, k) => { if (now - d.at > 6 * 3600e3) rowDone.delete(k); });
+  }
+
+  // Session row snapshot for debugging in DevTools console:
+  // __claudeDumpRows() = table, __claudeDumpRows('opus') = with HTML of matching rows.
+  // Icon-font PUA and invisible chars get stripped on paste, so encode as ⟦U+XXXX⟧; keep only descriptive classes (blue/accent/spin/dot/...).
+  const visChars = (t) => t.replace(/[\ue000-\uf8ff\u200b-\u200f\u2060\ufeff]/g, (c) => '⟦U+' + c.charCodeAt(0).toString(16).toUpperCase() + '⟧');
+  const slimHtml = (h) => visChars(h)
+    .replace(/ class="([^"]*)"/g, (m, c) => { const k = c.split(/\s+/).filter((t) => t.length < 40 && !t.includes(':') && /blue|accent|spin|anim|pulse|busy|dot|unread|status/i.test(t)); return k.length ? ` class="${k.join(' ')}"` : ''; })
+    .replace(/ d="([^"]{30})[^"]*"/g, ' d="$1…"');
+  function dumpRows(filter, withHtml) {
+    return [...document.querySelectorAll('[data-row-key]')]
+      .filter((r) => filter ? (rowLabel(r) + r.getAttribute('data-row-key')).toLowerCase().includes(String(filter).toLowerCase()) : /^code:/.test(r.getAttribute('data-row-key')))
+      .slice(0, 12)
+      .map((row) => {
+        const all = [...row.querySelectorAll('*')];
+        const o = {
+          key: row.getAttribute('data-row-key').slice(-12), label: rowLabel(row), current: !!row.querySelector('[aria-current="page"]'),
+          spinner: !!row.querySelector(BUSY_SEL),
+          cds: all.filter((e) => e.hasAttribute('data-cds')).map((e) => e.getAttribute('data-cds') + (e.textContent.trim() ? '«' + visChars(e.textContent.trim()) + '»' : '')).join(' '),
+          aria: all.filter((e) => e.matches('[aria-busy],[role=progressbar],[role=status],svg')).length,
+          anim: all.map((e) => getComputedStyle(e).animationName).filter((a) => a && a !== 'none').join(' ')
+        };
+        if (withHtml) o.html = slimHtml(row.outerHTML);
+        return o;
+      });
+  }
+  window.__claudeDumpRows = (filter) => { const out = dumpRows(filter, !!filter); console.table(out.map(({ html, ...r }) => r)); return out; };
+
+  // 1s tick: pre/post-reset sounds and auto-clicking "Try again"
+  let lastTick = 0;
+  function handleTimersAndAutoClick() {
+    const now = Date.now();
+    if (lastTick && now - lastTick > 3000) diag('tick-gap', { s: Math.round((now - lastTick) / 1000) }); // timer throttled or tab frozen
+    lastTick = now;
+    detectResponseDone();
+    detectRowsDone();
+    const limitUI = findLimitCardAndTryAgainBtn();
+
+    // If a limit card is visible and API reset timestamp is unknown, parse it from card text
+    if (limitUI && !state.sessionResetTs) {
+      const fallbackTs = parseFallbackResetTsFromText(limitUI.text);
+      if (fallbackTs) {
+        state.sessionResetTs = fallbackTs;
+      }
+    }
+
+    const resetTs = state.sessionResetTs;
+
+    if (resetTs) {
+      const diffMs = resetTs - now;
+
+      // 1) Alert 1 minute (60s) before session reset
+      if (diffMs > 0 && diffMs <= 60 * 1000 && lastPreResetSoundTs !== resetTs) {
+        lastPreResetSoundTs = resetTs;
+        localStorage.setItem('claude_overlay_pre_sound_ts', String(resetTs));
+        claimOnce('pre-' + resetTs, 120000).then((ok) => { if (ok && cfg.soundPre) playPreResetBeep(); });
+        state.statusNote = '🔔 Session resets in <1 min!';
+      }
+
+      // 2) Alert when session recovers (0..30s window after reset)
+      if (diffMs <= 0 && diffMs > -30 * 1000 && lastResetSoundTs !== resetTs) {
+        lastResetSoundTs = resetTs;
+        localStorage.setItem('claude_overlay_reset_sound_ts', String(resetTs));
+        claimOnce('reset-' + resetTs, 120000).then((ok) => { if (ok && cfg.soundReset) playSessionResetBeep(); });
+        state.statusNote = '✅ Session recovered!';
+        setTimeout(updateAll, 2000);
+      }
+
+      // 3) Auto-click "Try again" after reset (+1.5s buffer for server clock skew)
+      if (state.autoTryAgain && limitUI && now >= resetTs + 1500) {
+        if (lastClickedCycleTs !== resetTs) {
+          lastClickedCycleTs = resetTs;
+          tryAgainAttemptsForCycle = 0;
+        }
+
+        if (tryAgainAttemptsForCycle < 3 && now - lastTryAgainClickTime >= 5000) {
+          lastTryAgainClickTime = now;
+          tryAgainAttemptsForCycle++;
+          console.log(`[Claude Usage Overlay] Auto-clicking "Try again" (attempt ${tryAgainAttemptsForCycle}/3)`);
+          limitUI.btn.click();
+          state.statusNote = `🔄 Clicked "Try again" (${tryAgainAttemptsForCycle}/3)`;
+        }
+      }
+    }
+
+    renderOverlay();
+  }
+
+  // Session list: working (🔄) and finished unvisited (✅) with duration; clicking opens the session. Rest = idle counter.
+  function sessionsHtml() {
+    if (!cfg.sessList) return '';
+    const rows = [...document.querySelectorAll('[data-row-key]')].filter((r) => /^code:/.test(r.getAttribute('data-row-key')));
+    if (!rows.length) return '';
+    const now = Date.now(), items = [];
+    let idle = 0;
+    rows.forEach((r) => {
+      const key = r.getAttribute('data-row-key');
+      const busy = !!r.querySelector(BUSY_SEL), done = rowDone.get(key);
+      if (busy) items.push({ key, icon: '🔄', title: rowLabel(r), t: now - ((rowBusy.get(key) || {}).since || now), o: 0 });
+      else if (done) items.push({ key, icon: '✅', title: rowLabel(r) || done.title, t: now - done.at, o: 1 });
+      else idle++;
+    });
+    items.sort((a, b) => a.o - b.o || a.t - b.t);
+    const li = items.slice(0, 8).map((i) => `
+      <div data-sess="${esc(i.key)}" title="Open session" style="display:flex;gap:5px;align-items:center;font-size:11px;cursor:pointer;padding:1px 0;">
+        <span>${i.icon}</span><span style="flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:150px">${esc(i.title)}</span><small style="color:#888">${fmtDur(i.t)}</small>
+      </div>`).join('');
+    return `<div style="border-top:1px solid #333;padding-top:5px;margin-top:4px;">
+      <div style="font-size:10px;color:#888;margin-bottom:2px">Sessions: ${items.filter((i) => i.o === 0).length} working, ${items.filter((i) => i.o === 1).length} ready</div>
+      ${li}${items.length > 8 ? `<div style="font-size:10px;color:#888">+${items.length - 8} more</div>` : ''}
+      <div style="font-size:10px;color:#666">⚪ ${idle} idle</div></div>`;
+  }
+
+  function getColorForPct(pct) {
+    const num = parseInt(pct, 10);
+    if (isNaN(num)) return '#aaa';
+    if (num >= cfg.threshold) return '#ff5252';
+    if (num >= 60) return '#ffb74d';
+    return '#4caf50';
+  }
+
+  function renderProgressBar(pct) {
+    const num = Math.min(100, Math.max(0, parseInt(pct, 10) || 0));
+    const color = getColorForPct(num);
+    return `
+      <div style="width:100%;height:5px;background:#333;border-radius:3px;overflow:hidden;margin:3px 0 5px 0;">
+        <div style="width:${num}%;height:100%;background:${color};transition:width 0.3s ease;"></div>
+      </div>
+    `;
+  }
+
+  function renderOverlay() {
+    applyTitle();
+    const el = document.getElementById('claude-usage-overlay');
+    if (!el) return;
+
+    const isCritical = (state.hasContextUI && state.contextPct >= cfg.threshold) ||
+                       (parseInt(state.sessionPct, 10) >= 90);
+
+    if (isCritical) {
+      el.classList.add('claude-overlay-critical');
+    } else {
+      el.classList.remove('claude-overlay-critical');
+    }
+
+    if (state.error) {
+      el.innerHTML = `
+        <div style="font-weight:bold;color:#ff6b6b">⚠️ Claude API Error</div>
+        <div style="font-size:10px;color:#aaa">Last attempt: ${esc(state.lastTry || 'now')}</div>
+      `;
+      return;
+    }
+
+    const alertBanner = (state.hasContextUI && state.contextPct >= cfg.threshold)
+      ? `<div style="background:#d32f2f;color:#fff;font-weight:bold;font-size:10px;padding:3px 6px;border-radius:4px;margin-bottom:6px;text-align:center;">
+           🚨 WARNING: CONTEXT ${state.contextPct}% (>=${cfg.threshold}%)
+         </div>`
+      : '';
+
+    const statusBanner = state.statusNote
+      ? `<div style="background:#1b3a28;color:#81c784;border:1px solid #2e7d32;font-size:10px;padding:3px 6px;border-radius:4px;margin-bottom:6px;text-align:center;">
+           ${esc(state.statusNote)}
+         </div>`
+      : '';
+
+    const perm = 'Notification' in window ? Notification.permission : 'granted';
+    const permBanner = (cfg.doneNotify && perm !== 'granted')
+      ? `<div style="background:#3a2a1b;color:#ffb74d;border:1px solid #8d5a1e;font-size:10px;padding:3px 6px;border-radius:4px;margin-bottom:6px;text-align:center;">
+           🔕 ${perm === 'denied' ? 'notifications blocked (🔒 near URL → Allow)' : 'click here to enable notifications'}
+         </div>`
+      : '';
+
+    const contextSection = state.hasContextUI
+      ? `
+        <div style="margin-bottom:6px;padding-bottom:6px;border-bottom:1px solid #333;">
+          <div style="display:flex;justify-content:space-between;align-items:center;">
+            <span>🧠 <b>Context (1M):</b></span>
+            <b style="color:${getColorForPct(state.contextPct)};font-size:13px;">${state.contextPct}%</b>
+          </div>
+          ${renderProgressBar(state.contextPct)}
+          <div style="font-size:10px;color:#aaa;text-align:right;">
+            <span>${esc(state.contextText)}</span>
+          </div>
+        </div>
+      `
+      : `
+        <div style="margin-bottom:6px;padding-bottom:6px;border-bottom:1px solid #333;font-size:11px;color:#888;">
+          🧠 Context: <i>Open Context panel in Claude</i>
+        </div>
+      `;
+
+    el.innerHTML = `
+      ${alertBanner}
+      ${statusBanner}
+      ${permBanner}
+      <div style="font-weight:bold;margin-bottom:6px;display:flex;justify-content:space-between;align-items:center;border-bottom:1px solid #333;padding-bottom:4px;">
+        <span>📊 Claude Monitor</span>
+        <span id="claude-cfg-btn" title="Settings" style="cursor:pointer;font-size:13px;font-weight:normal;">⚙</span>
+      </div>
+
+      ${contextSection}
+
+      <div style="display:flex;justify-content:space-between;">
+        <span>🕐 Session (5h):</span>
+        <b style="color:${getColorForPct(state.sessionPct)}">${state.sessionPct}%</b>
+      </div>
+      ${renderProgressBar(state.sessionPct)}
+      <div style="font-size:10px;color:#aaa;margin-bottom:6px">${formatResetTime(state.sessionResetTs, true)}</div>
+      ${fcHtml('session')}
+
+      <div style="display:flex;justify-content:space-between;">
+        <span>📅 Weekly (7d):</span>
+        <b style="color:${getColorForPct(state.weeklyPct)}">${state.weeklyPct}%</b>
+      </div>
+      ${renderProgressBar(state.weeklyPct)}
+      <div style="font-size:10px;color:#aaa;margin-bottom:6px">${formatResetTime(state.weeklyResetTs, false)}</div>
+      ${fcHtml('weekly')}
+      ${sessionsHtml()}
+
+      <div style="border-top:1px solid #333;padding-top:5px;margin-top:4px;display:flex;justify-content:space-between;align-items:center;font-size:10px;">
+        <label style="display:flex;align-items:center;gap:5px;cursor:pointer;color:#ccc;" title="Automatically clicks 'Try again' after limit reset">
+          <input id="claude-auto-try-again-cb" type="checkbox" ${state.autoTryAgain ? 'checked' : ''} style="cursor:pointer;margin:0;">
+          <span>Auto-click "Try again"</span>
+        </label>
+        <button id="claude-test-sound-btn" type="button" title="Test reset sound" style="background:#2d2d2d;color:#bbb;border:1px solid #444;border-radius:4px;padding:1px 5px;font-size:9px;cursor:pointer;">
+          🔊 Test
+        </button>
+      </div>
+
+      <div style="font-size:9px;color:#666;margin-top:5px;border-top:1px solid #333;padding-top:4px;display:flex;justify-content:space-between;">
+        <span>Auto: ${cfg.refreshSec}s</span>
+        <span ${state.stale ? 'style="color:#ff8a80" title="Last API request failed (attempt ' + esc(state.lastTry) + ')"' : ''}>Status: ${esc(state.lastUpdated) || '...'}${state.stale ? ' ⚠ stale' : ''}</span>
+      </div>
+    `;
+
+    // Bind events for settings, checkbox, and sound test buttons
+    const gearBtn = document.getElementById('claude-cfg-btn');
+    if (gearBtn) gearBtn.onpointerdown = (e) => { e.stopPropagation(); e.preventDefault(); askNotifyPermission(); openSettings(); };
+
+    const cb = document.getElementById('claude-auto-try-again-cb');
+    if (cb) {
+      cb.onchange = (e) => {
+        state.autoTryAgain = e.target.checked;
+        localStorage.setItem('claude_overlay_auto_try_again', String(state.autoTryAgain));
+      };
+    }
+
+    const testBtn = document.getElementById('claude-test-sound-btn');
+    if (testBtn) {
+      testBtn.onclick = (e) => {
+        e.stopPropagation();
+        playSessionResetBeep();
+      };
+    }
+  }
+
+  // Draggable overlay with saved position (opacity is managed by applyCfg)
+  function makeMovable(el, key) {
+    const st = document.createElement('style');
+    st.textContent = `#${el.id}{touch-action:none}`;
+    document.head.appendChild(st);
+
+    function place(x, y) {
+      x = Math.max(0, Math.min(x, window.innerWidth - el.offsetWidth));
+      y = Math.max(0, Math.min(y, window.innerHeight - el.offsetHeight));
+      Object.assign(el.style, { left: x + 'px', top: y + 'px', right: 'auto', bottom: 'auto' });
+    }
+    try {
+      const p = JSON.parse(localStorage.getItem(key));
+      if (p) place(p.x, p.y);
+    } catch (e) {}
+
+    let drag = null, moved = false;
+    el.addEventListener('pointerdown', (e) => {
+      if (e.button !== 0 || e.target.closest('input,label,button,[data-sess]')) return; // pointer capture would swallow clicks
+      const r = el.getBoundingClientRect();
+      drag = { dx: e.clientX - r.left, dy: e.clientY - r.top, sx: e.clientX, sy: e.clientY };
+      moved = false;
+      el.setPointerCapture(e.pointerId);
+    });
+    el.addEventListener('pointermove', (e) => {
+      if (!drag) return;
+      if (!moved && Math.hypot(e.clientX - drag.sx, e.clientY - drag.sy) < 4) return; // normal click
+      moved = true;
+      place(e.clientX - drag.dx, e.clientY - drag.dy);
+    });
+    el.addEventListener('pointerup', () => {
+      if (drag && moved) {
+        try { localStorage.setItem(key, JSON.stringify({ x: el.offsetLeft, y: el.offsetTop })); } catch (e) {}
+      }
+      drag = null;
+    });
+    // Suppress refresh click after dragging
+    el.addEventListener('click', (e) => {
+      if (moved) { e.stopImmediatePropagation(); moved = false; }
+    }, true);
+    window.addEventListener('resize', () => { if (el.style.left) place(el.offsetLeft, el.offsetTop); });
+  }
+
+  let lastApiAt = 0, updating = false, backoffMs = 0, apiBlockedUntil = 0;
+  // force = manual click on overlay bypasses 429/401 backoff.
+  async function updateAll(force) {
+    if (updating) return; // prevent concurrent API requests
+    lastApiAt = Date.now();
+    const contextData = scrapeContextFromDOM();
+    Object.assign(state, contextData);
+    if (force !== true && Date.now() < apiBlockedUntil) { renderOverlay(); return; }
+    updating = true;
+
+    const t = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+    try {
+      const usageData = await fetchUsageFromApi();
+      backoffMs = 0; apiBlockedUntil = 0;
+      Object.assign(state, usageData, { error: false, stale: false, lastUpdated: t });
+      recordHist('session', state.sessionPct); recordHist('weekly', state.weeklyPct);
+      checkForecast();
+    } catch (err) {
+      console.error('[Claude Usage Overlay]', err);
+      // keep existing values marked as stale; show full error only when nothing was loaded yet
+      state.stale = true;
+      state.lastTry = t;
+      if (state.sessionPct === '?') state.error = true;
+      if (err && err.backoff) { // 429/401: double interval (start at 2× refreshSec), max 10 min
+        backoffMs = Math.min(600000, backoffMs ? backoffMs * 2 : Math.max(2, cfg.refreshSec) * 2000);
+        apiBlockedUntil = Date.now() + backoffMs;
+        diag('backoff', { s: Math.round(backoffMs / 1000) });
+      }
+    } finally { updating = false; }
+    renderOverlay();
+  }
+
+  function initOverlay() {
+    if (document.getElementById('claude-usage-overlay')) return;
+    injectStyles();
+
+    const overlay = document.createElement('div');
+    overlay.id = 'claude-usage-overlay';
+    overlay.style.cssText = `
+      position:fixed; bottom:80px; right:16px; z-index:999999;
+      background:#1e1e1e; color:#e0e0e0; padding:10px 14px;
+      border-radius:8px; font-size:12px; border:1px solid #444;
+      min-width:220px; line-height:1.4; cursor:pointer;
+      box-shadow: 0 4px 12px rgba(0,0,0,0.5); user-select: none;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      transition: background 0.3s ease, border-color 0.3s ease, opacity 0.2s ease;
+    `;
+    overlay.textContent = 'Loading monitor...';
+    overlay.title = 'Click overlay background to refresh manually; drag to move';
+    overlay.onclick = (e) => {
+      if (e.target.closest('input, label, button, [data-sess]')) return;
+      askNotifyPermission();
+      updateAll(true);
+    };
+    overlay.addEventListener('click', (e) => { // jump to session from list (delegated: list re-renders every second)
+      const it = e.target.closest('[data-sess]');
+      if (!it) return;
+      e.stopImmediatePropagation();
+      openSession(it.getAttribute('data-sess'));
+      renderOverlay();
+    }, true);
+    document.body.appendChild(overlay);
+    makeMovable(overlay, 'claude_overlay_pos_v1');
+
+    updateAll();
+    applyCfg();
+    // Background tab polls API at most once per minute (needed for % in title); refreshes immediately on return.
+    (function loopApi() { setTimeout(() => { if (!document.hidden || Date.now() - lastApiAt >= 60000) updateAll(); loopApi(); }, Math.max(2, cfg.refreshSec) * 1000); })();
+    document.addEventListener('visibilitychange', () => { diag('vis'); if (!document.hidden) { clearDone(); updateAll(); } });
+    ['pointerdown', 'keydown', 'focus'].forEach((ev) => window.addEventListener(ev, clearDone, true));
+    // Page itself updates <title> (SPA) — re-apply our prefix
+    try { new MutationObserver(applyTitle).observe(document.head, { childList: true, subtree: true, characterData: true }); } catch (e) {}
+    // Event-driven detection: MutationObserver is not throttled in background tabs (chained setInterval is after ~5 min),
+    // and a one-shot setTimeout from its callback is not chained, so the ">=2s idle" confirmation fires on time.
+    let detT = 0, mutHid = 0, mutHidAt = 0;
+    const schedDet = (ms) => { if (!detT) detT = setTimeout(runDet, ms); };
+    function runDet() {
+      detT = 0;
+      detectResponseDone(); detectRowsDone(); applyTitle();
+      if (genIdleAt || [...rowBusy.values()].some((r) => r.idleAt)) schedDet(2100);
+    }
+    try {
+      new MutationObserver((recs) => {
+        if (!recs.some((m) => !overlay.contains(m.target))) return; // skip our own 1s renders
+        if (document.hidden) { mutHid++; const n = Date.now(); if (n - mutHidAt > 30000) { diag('mut-hidden', { c: mutHid }); mutHidAt = n; mutHid = 0; } }
+        schedDet(500);
+      }).observe(document.body, { subtree: true, childList: true, attributes: true, attributeFilter: ['data-cds', 'data-is-streaming', 'aria-label', 'aria-current'] });
+    } catch (e) {}
+    setInterval(handleTimersAndAutoClick, TICK_INTERVAL_MS);
+  }
+
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', initOverlay);
+  } else {
+    initOverlay();
+  }
+})();
