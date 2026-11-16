@@ -19,7 +19,7 @@ jobs:
           node-version: '20'
       - name: Syntax check
         run: node --check claude-usage.user.js
-      - name: Metadata and @grant none checks
+      - name: Metadata, version sync, and safety checks
         run: |
           node -e '
             const fs = require("fs");
@@ -31,7 +31,12 @@ jobs:
               if (!h.includes(tag)) throw new Error("Missing header tag: " + tag);
             }
             if (!/@grant\s+none\b/.test(h)) throw new Error("Script must keep @grant none");
+            const hdrVer = (/@version\s+(\S+)/.exec(h) || [])[1];
+            const codeVer = (/const\s+VERSION\s*=\s*[\x27"]([^\x27"]+)[\x27"]/.exec(s) || [])[1];
+            if (!hdrVer || hdrVer !== codeVer) {
+              throw new Error(`Version mismatch: @version=${hdrVer} vs VERSION=${codeVer}`);
+            }
             const body = s.slice(hdr[0].length);
             if (/\b(?:GM_|unsafeWindow\b)/.test(body)) throw new Error("GM_* / unsafeWindow found while @grant none is set");
-            console.log("OK:", /@version\s+(\S+)/.exec(h)[1]);
+            console.log("OK:", hdrVer);
           '

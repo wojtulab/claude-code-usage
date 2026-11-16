@@ -15,7 +15,7 @@ Pull requests and DOM selector updates are welcome!
    ```bash
    node --check claude-usage.user.js
    ```
-2. Bump `// @version` in the `==UserScript==` header (using SemVer: patch for fixes, minor for features) so users get the update via `@updateURL`.
+2. Bump both `// @version` in the `==UserScript==` header and `const VERSION` in code (checked by CI; using SemVer: patch for fixes, minor for features) so users get the update via `@updateURL`.
 3. Note in the PR description which browser and userscript manager (Tampermonkey / Violentmonkey) you tested on.
 
 ## Debugging DOM Changes

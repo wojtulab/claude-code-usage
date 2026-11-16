@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Claude.ai Usage & Context Overlay (DOM Sync v2.2)
 // @namespace    https://github.com/wojtulab/claude-code-usage
-// @version      2.11.1
+// @version      2.12.0
 // @description  Monitor Claude.ai 1M context and 5h/7d usage limits, sound/browser alerts before & after reset or response completion, and auto-click "Try again".
 // @homepageURL  https://github.com/wojtulab/claude-code-usage
 // @supportURL   https://github.com/wojtulab/claude-code-usage/issues
@@ -16,6 +16,7 @@
 (function () {
   'use strict';
 
+  const VERSION = '2.12.0';
   const TICK_INTERVAL_MS = 1000;             // Countdown, alerts, and button checks every 1s
 
   // Settings: ⚙ panel in overlay header, saved to localStorage (claude_overlay_cfg_v1). CFG_SCHEMA entries: [key, label, type, default].
@@ -25,6 +26,8 @@
     ['soundContext', 'Sound: context ≥ threshold / quota forecast', 'bool', true],
     ['soundPre', 'Sound: 1 minute before reset', 'bool', true],
     ['soundReset', 'Sound: session recovered', 'bool', true],
+    ['qSound', 'Question / approval: sound', 'bool', true],
+    ['qNotify', 'Question / approval: browser notification', 'bool', true],
     ['doneSound', 'Response ready: sound', 'bool', true],
     ['doneNotify', 'Response ready: browser notification', 'bool', true],
     ['doneMinSec', 'Response ready: min generation time (s)', 'num', 10],
@@ -36,8 +39,9 @@
     ['opacityIdle', 'Opacity (%)', 'num', 50],
     ['opacityHover', 'Opacity on hover (%)', 'num', 90]
   ];
-  const cfg = Object.fromEntries(CFG_SCHEMA.map((s) => [s[0], s[3]]));
+  const cfg = Object.assign({ minimized: false }, Object.fromEntries(CFG_SCHEMA.map((s) => [s[0], s[3]])));
   try { Object.assign(cfg, JSON.parse(localStorage.getItem('claude_overlay_cfg_v1')) || {}); } catch (e) {}
+  cfg.minimized = !!cfg.minimized;
 
   function applyCfg() {
     let st = document.getElementById('claude-usage-overlay-cfgstyle');
@@ -47,13 +51,12 @@
 
   function openSettings() {
     const old = document.getElementById('claude-usage-overlay-cfg');
-    if (old) { old.remove(); return; }
+    if (old) { if (old._close) old._close(); else old.remove(); return; }
     const ov = document.getElementById('claude-usage-overlay');
-    const r = ov ? ov.getBoundingClientRect() : { left: innerWidth - 16, bottom: innerHeight - 80 };
+    const r = ov ? ov.getBoundingClientRect() : { left: innerWidth - 16, right: innerWidth - 16, top: innerHeight - 160, bottom: innerHeight - 80 };
     const p = document.createElement('div');
     p.id = 'claude-usage-overlay-cfg';
-    p.style.cssText = 'position:fixed;z-index:2147483647;background:#1e1e1e;color:#e0e0e0;border:1px solid #777;border-radius:8px;padding:10px 12px;font:12px sans-serif;box-shadow:0 4px 16px rgba(0,0,0,.6);min-width:240px;' +
-      'right:' + Math.max(8, innerWidth - r.left + 8) + 'px;bottom:' + Math.max(8, innerHeight - r.bottom) + 'px;';
+    p.style.cssText = 'position:fixed;z-index:2147483647;background:#1e1e1e;color:#e0e0e0;border:1px solid #777;border-radius:8px;padding:10px 12px;font:12px sans-serif;box-shadow:0 4px 16px rgba(0,0,0,.6);min-width:240px;max-width:calc(100vw - 16px);max-height:calc(100vh - 16px);overflow-y:auto;';
     const h = document.createElement('div');
     h.textContent = '⚙ Claude Settings';
     h.style.cssText = 'font-weight:bold;margin-bottom:8px;border-bottom:1px solid #333;padding-bottom:4px;';
@@ -71,6 +74,7 @@
         if (type === 'bool' && i.checked && /Notify$/.test(k)) askNotifyPermission();
         try { localStorage.setItem('claude_overlay_cfg_v1', JSON.stringify(cfg)); } catch (e) {}
         applyCfg();
+        renderOverlay();
       };
       row.append(t, i);
       p.appendChild(row);
@@ -81,6 +85,34 @@
     p.appendChild(x);
     p.addEventListener('click', (e) => e.stopPropagation());
     document.body.appendChild(p);
+
+    const pr = p.getBoundingClientRect();
+    const cx = (r.left + r.right) / 2, cy = (r.top + r.bottom) / 2;
+    if (cx < innerWidth / 2) {
+      const leftPx = (r.right + 8 + pr.width <= innerWidth - 8) ? r.right + 8 : Math.min(r.left, innerWidth - pr.width - 8);
+      p.style.left = Math.max(8, leftPx) + 'px';
+    } else {
+      const rightPx = (r.left - 8 - pr.width >= 8) ? innerWidth - r.left + 8 : Math.min(innerWidth - r.right, innerWidth - pr.width - 8);
+      p.style.right = Math.max(8, rightPx) + 'px';
+    }
+    if (cy < innerHeight / 2) {
+      const topPx = (r.top + pr.height <= innerHeight - 8) ? r.top : Math.min(r.bottom + 6, innerHeight - pr.height - 8);
+      p.style.top = Math.max(8, topPx) + 'px';
+    } else {
+      const botPx = (r.bottom - pr.height >= 8) ? innerHeight - r.bottom : Math.min(innerHeight - r.top + 6, innerHeight - pr.height - 8);
+      p.style.bottom = Math.max(8, botPx) + 'px';
+    }
+
+    const close = () => {
+      p.remove();
+      document.removeEventListener('keydown', onKey, true);
+      document.removeEventListener('pointerdown', onOutside, true);
+    };
+    p._close = close;
+    const onKey = (e) => { if (e.key === 'Escape') { e.stopPropagation(); close(); } };
+    const onOutside = (e) => { if (!p.contains(e.target) && !(ov && ov.contains(e.target))) close(); };
+    document.addEventListener('keydown', onKey, true);
+    document.addEventListener('pointerdown', onOutside, true);
   }
 
   let cachedOrgId = localStorage.getItem('claude_overlay_org_id') || null;
@@ -94,6 +126,10 @@
   let lastTryAgainClickTime = 0;
   let tryAgainAttemptsForCycle = 0;
   let lastClickedCycleTs = 0;
+
+  const STATE_KEY = 'claude_overlay_state_v1';
+  let statusNoteUntil = 0;
+  let lastSuccessTs = 0;
 
   let state = {
     sessionPct: '?',
@@ -109,6 +145,40 @@
     statusNote: ''
   };
 
+  function setNote(txt, ttlMs = 45000) {
+    state.statusNote = txt || '';
+    statusNoteUntil = txt ? Date.now() + ttlMs : 0;
+  }
+
+  function sanitizeSharedState(d) {
+    if (!d || typeof d !== 'object' || Array.isArray(d)) return null;
+    const clean = {};
+    if ((typeof d.sessionPct === 'number' && Number.isFinite(d.sessionPct)) || d.sessionPct === '?') clean.sessionPct = d.sessionPct;
+    if ((typeof d.weeklyPct === 'number' && Number.isFinite(d.weeklyPct)) || d.weeklyPct === '?') clean.weeklyPct = d.weeklyPct;
+    if ((typeof d.sessionResetTs === 'number' && Number.isFinite(d.sessionResetTs) && d.sessionResetTs > 0) || d.sessionResetTs === null) clean.sessionResetTs = d.sessionResetTs;
+    if ((typeof d.weeklyResetTs === 'number' && Number.isFinite(d.weeklyResetTs) && d.weeklyResetTs > 0) || d.weeklyResetTs === null) clean.weeklyResetTs = d.weeklyResetTs;
+    if (typeof d.extraEnabled === 'boolean') clean.extraEnabled = d.extraEnabled;
+    if ((typeof d.extraPct === 'number' && Number.isFinite(d.extraPct)) || d.extraPct === '?') clean.extraPct = d.extraPct;
+    if ((typeof d.extraUsed === 'number' && Number.isFinite(d.extraUsed)) || d.extraUsed === null) clean.extraUsed = d.extraUsed;
+    if ((typeof d.extraLimit === 'number' && Number.isFinite(d.extraLimit)) || d.extraLimit === null) clean.extraLimit = d.extraLimit;
+    if (typeof d.lastUpdated === 'string') clean.lastUpdated = d.lastUpdated.slice(0, 40);
+    else if (d.lastUpdated === null) clean.lastUpdated = null;
+    if (typeof d.fetchedAt === 'number' && Number.isFinite(d.fetchedAt) && d.fetchedAt > 0) clean.fetchedAt = d.fetchedAt;
+    return Object.keys(clean).length ? clean : null;
+  }
+
+  try {
+    const cached = localStorage.getItem(STATE_KEY);
+    if (cached) {
+      const clean = sanitizeSharedState(JSON.parse(cached));
+      if (clean) {
+        const { fetchedAt, ...fields } = clean;
+        Object.assign(state, fields);
+        if (fetchedAt) lastSuccessTs = fetchedAt;
+      }
+    }
+  } catch (e) {}
+
   function injectStyles() {
     if (document.getElementById('claude-overlay-styles')) return;
     const style = document.createElement('style');
@@ -119,9 +189,17 @@
         70% { box-shadow: 0 0 0 10px rgba(244, 67, 54, 0), 0 4px 12px rgba(0,0,0,0.5); border-color: #ff7961; }
         100% { box-shadow: 0 0 0 0 rgba(244, 67, 54, 0), 0 4px 12px rgba(0,0,0,0.5); border-color: #f44336; }
       }
+      @keyframes claudePulseOrange {
+        0%, 100% { border-color: #444; box-shadow: 0 4px 12px rgba(0,0,0,0.5); }
+        50% { border-color: #ff9800; box-shadow: 0 0 14px 3px #ff9800; }
+      }
       .claude-overlay-critical {
         animation: claudePulseRed 2s infinite !important;
         background: #2a1215 !important;
+      }
+      .claude-overlay-question {
+        border: 2px solid #ff9800 !important;
+        animation: claudePulseOrange 1s ease-in-out infinite !important;
       }
     `;
     document.head.appendChild(style);
@@ -264,6 +342,14 @@
     ]);
   }
 
+  // Question / approval alert: crisp two-tone prompt
+  function playQuestionBeep() {
+    playTones([
+      { freq: 880, start: 0, duration: 0.14, type: 'sine', gainVal: 0.12 },
+      { freq: 1175, start: 0.18, duration: 0.15, type: 'sine', gainVal: 0.12 }
+    ]);
+  }
+
   function formatResetTime(ts, showSeconds = false) {
     if (!ts) return 'No data';
     try {
@@ -358,7 +444,11 @@
     if (pctVal !== null) {
       if (pctVal >= cfg.threshold && !alertedContext) {
         alertedContext = true;
-        if (cfg.soundContext) playContextAlertBeep();
+        if (cfg.soundContext) {
+          claimOnce('ctx-alert', 60000).then((ok) => {
+            if (ok && cfg.soundContext) playContextAlertBeep();
+          });
+        }
       } else if (pctVal < cfg.threshold) {
         alertedContext = false;
       }
@@ -408,47 +498,132 @@
     return target.getTime();
   }
 
-  // Tab title: "🔄 41% · Claude Code" (busy), "✅3 🔄2 41% · …" (done/busy counters), "41% · …" (idle).
+  // Tab title: "🔄 41% · Claude Code" (busy), "✅3 🔄2 41% · …" (done/busy counters), "❓ …" (question/approval priority), "41% · …" (idle).
   // % = 5h session usage. Strip prefix before re-applying so page title updates don't loop.
-  const TITLE_PREFIX_RE = /^(?:✅\d*\s+)?(?:🔄\d*\s+)?(?:\d{1,3}% · )?/;
-  let titleDone = false;
+  const TITLE_PREFIX_RE = /^(?:(?:❓|✅)\d*\s+)?(?:🔄\d*\s+)?(?:\d{1,3}% · )?/;
+  const QUESTION_ATTRS = ['permission', 'approve', 'allow', 'confirm', 'waiting for input', 'waiting-for-input', 'waiting_for_input', 'question'];
+  const QUESTION_SEL = QUESTION_ATTRS.flatMap((w) => [`[aria-label*="${w}" i]`, `[data-testid*="${w}" i]`]).join(', ');
+  const qMap = new Map(); // key → { title, current }
+  let titleDone = false, qActive = false, qBlink = false;
+  function isQuestionEl(el) {
+    if (!el || el.nodeType !== Node.ELEMENT_NODE) return false;
+    if (el.closest('#claude-usage-overlay, #claude-usage-overlay-cfg')) return false;
+    if (el.hidden || el.disabled || el.getAttribute('aria-hidden') === 'true') return false;
+    if (typeof el.checkVisibility === 'function' && !el.checkVisibility()) {
+      let vis = typeof getComputedStyle === 'function' && getComputedStyle(el).display === 'contents';
+      if (vis) {
+        for (let p = el.parentElement; p; p = p.parentElement) {
+          if (p.hidden || p.getAttribute('aria-hidden') === 'true' ||
+              (typeof p.checkVisibility === 'function' && !p.checkVisibility() && getComputedStyle(p).display !== 'contents')) {
+            vis = false; break;
+          }
+        }
+      }
+      if (!vis) return false;
+    }
+    const al = el.getAttribute('aria-label') || '';
+    const dt = el.getAttribute('data-testid') || '';
+    if (/^More options\b/i.test(al) || /cookie/i.test(al + ' ' + dt)) return false;
+    return true;
+  }
+  function rowHasQuestion(row) {
+    for (const el of row.querySelectorAll(QUESTION_SEL)) {
+      if (isQuestionEl(el) && !el.matches('a[data-row-main-button]')) return true;
+    }
+    return false;
+  }
+  function findChatQuestion() {
+    const scopes = document.querySelectorAll('main, [role="main"], [role="dialog"], [role="alertdialog"]');
+    const roots = scopes.length ? scopes : (document.body ? [document.body] : []);
+    for (const scope of roots) {
+      for (const el of scope.querySelectorAll(QUESTION_SEL)) {
+        if (!isQuestionEl(el) || el.closest('[data-row-key], nav')) continue;
+        return el;
+      }
+    }
+    return null;
+  }
+  function detectQuestions() {
+    const active = new Map();
+    let curRowHasQ = false;
+    document.querySelectorAll('[data-row-key]').forEach((row) => {
+      if (!rowHasQuestion(row)) return;
+      const key = row.getAttribute('data-row-key');
+      const current = !!row.querySelector('[aria-current="page"]');
+      if (current) curRowHasQ = true;
+      rowDone.delete(key);
+      active.set(key, { title: rowLabel(row) || key, current });
+    });
+    if (!curRowHasQ && findChatQuestion()) {
+      const chatTitle = document.title.replace(TITLE_PREFIX_RE, '').replace(/\s*[-–|]\s*Claude\s*$/i, '') || 'Claude';
+      active.set('chat', { title: chatTitle, current: true });
+    }
+    for (const k of [...qMap.keys()]) {
+      if (!active.has(k)) qMap.delete(k);
+    }
+    active.forEach((info, key) => {
+      if (qMap.has(key)) return;
+      qMap.set(key, info);
+      claimOnce('claude-q-' + key, 5000).then((ok) => {
+        if (!ok) { diag('claim-lost', { k: 'q' }); return; }
+        diag('q-alert', { k: key.slice(-12) });
+        if (cfg.qSound) playQuestionBeep();
+        if (cfg.qNotify) {
+          notify('Claude needs approval', info.title, 'claude-q-' + key, !info.current, true,
+            key !== 'chat' ? () => { openSession(key); applyTitle(); } : null);
+        }
+      });
+    });
+    qActive = active.size > 0;
+  }
   function isCurrentWorking() {
     if (genSince && !genIdleAt) return true;
-    for (const rec of rowBusy.values()) if (rec.current && !rec.idleAt) return true;
+    for (const rec of rowBusy.values()) if (rec.current && !rec.idleAt && !rec.question) return true;
     return false;
   }
   function busyCount() {
     let n = 0, cur = false;
-    for (const rec of rowBusy.values()) if (!rec.idleAt) { n++; if (rec.current) cur = true; }
+    for (const rec of rowBusy.values()) if (!rec.idleAt && !rec.question) { n++; if (rec.current) cur = true; }
     if (genSince && !genIdleAt && !cur) n++;
     return n;
   }
   function markDone() { if (away()) titleDone = true; }
   function clearDone() {
     if (away()) return;
+    if (!titleDone && !openNs.size && !rowDone.size && !qBlink) return;
     closeN();
     document.querySelectorAll('[data-row-key]').forEach((r) => {
       if (r.querySelector('[aria-current="page"]')) rowDone.delete(r.getAttribute('data-row-key'));
     });
     titleDone = false;
+    qBlink = false;
     applyTitle();
   }
-  // ✅ blinking and favicon are independent of 🔄/% prefix (titleInfo); ticked by applyTitle called every 1s from renderOverlay.
+  // ❓ takes priority over ✅; blinking and favicon are independent of 🔄/% prefix (titleInfo); ticked by applyTitle.
   function applyTitle() {
     if (isCurrentWorking()) titleDone = false;
-    setFav(titleDone && cfg.titleBlink ? '#22c55e' : '');
+    if (qActive && away()) qBlink = true;
+    else if (!qActive) qBlink = false;
+    setFav(qActive && away() ? '#f97316' : (titleDone && cfg.titleBlink ? '#22c55e' : ''));
     const base = document.title.replace(TITLE_PREFIX_RE, '');
+    const blinkHide = (Math.floor(Date.now() / 1000) % 2 === 1);
+    let alertPart = '';
+    if (qActive) {
+      alertPart = (away() && blinkHide) ? '' : '❓ ';
+    } else if (titleDone && cfg.titleBlink) {
+      const doneN = Math.max(rowDone.size, 1);
+      alertPart = blinkHide ? '' : '✅' + (doneN > 1 ? doneN : '') + ' ';
+    } else if (cfg.titleInfo && rowDone.size) {
+      alertPart = '✅' + (rowDone.size > 1 ? rowDone.size : '') + ' ';
+    }
     let next = base;
-    const blinkHide = titleDone && cfg.titleBlink && (Math.floor(Date.now() / 1000) % 2 === 1);
-    const doneN = Math.max(rowDone.size, titleDone ? 1 : 0);
-    const busyN = busyCount();
     if (cfg.titleInfo) {
-      const donePart = doneN && !blinkHide ? '✅' + (doneN > 1 ? doneN : '') + ' ' : '';
+      const busyN = busyCount();
       const busyPart = busyN ? '🔄' + (busyN > 1 ? busyN : '') + ' ' : '';
       const pct = /^\d+$/.test(String(state.sessionPct)) ? state.sessionPct + '% · ' : '';
-      next = donePart + busyPart + pct + base;
-    } else if (cfg.titleBlink && titleDone && !blinkHide) {
-      next = '✅ ' + base;
+      next = alertPart + busyPart + pct + base;
+    } else {
+      next = alertPart + base;
     }
     if (document.title !== next) document.title = next;
   }
@@ -500,6 +675,16 @@
       if (e.key === 'claude_overlay_pre_sound_ts') lastPreResetSoundTs = Number(e.newValue) || 0;
       else if (e.key === 'claude_overlay_reset_sound_ts') lastResetSoundTs = Number(e.newValue) || 0;
       else if (e.key === 'claude_overlay_fc_v1') fcAlerted = JSON.parse(e.newValue) || {};
+      else if (e.key === STATE_KEY && e.newValue) {
+        const d = sanitizeSharedState(JSON.parse(e.newValue));
+        if (d) {
+          const { fetchedAt, ...fields } = d;
+          Object.assign(state, fields, { error: false, stale: false });
+          if (fetchedAt) lastSuccessTs = fetchedAt;
+          applyTitle();
+          renderOverlay();
+        }
+      }
     } catch (err) {}
   });
   function checkForecast() {
@@ -552,13 +737,14 @@
       return;
     }
     if (!genSince) return;
+    if ([...qMap.values()].some((q) => q.current)) { genIdleAt = 0; return; }
     if (!genIdleAt) { genIdleAt = now; diag('stop-'); }
     if (now - genIdleAt < 2000) return;
     const dur = now - genSince;
     genSince = 0; genIdleAt = 0;
     markDone();
     if (dur < cfg.doneMinSec * 1000) { diag('too-short', { s: Math.round(dur / 1000) }); return; }
-    alertDone(document.title.replace(/\s*[-–|]\s*Claude\s*$/i, ''), 'claude-done');
+    alertDone(document.title.replace(TITLE_PREFIX_RE, '').replace(/\s*[-–|]\s*Claude\s*$/i, ''), 'claude-done');
   }
 
   // Sidebar sessions (claude.ai/code): active `[data-row-key]` row has a dot in `[data-row-decoration]`:
@@ -583,12 +769,16 @@
       if (!away() && row.querySelector('[aria-current="page"]')) rowDone.delete(key); // session visited
       if (row.querySelector(BUSY_SEL)) {
         rowDone.delete(key);
-        if (!rec) { rowBusy.set(key, rec = { since: now, idleAt: 0, seen: now, title: '', current: false }); diag('spin+', { r: key.slice(-6) }); }
-        rec.idleAt = 0; rec.seen = now; rec.title = rowLabel(row); rec.current = !!row.querySelector('[aria-current="page"]');
+        if (!rec) { rowBusy.set(key, rec = { since: now, idleAt: 0, seen: now, title: '', current: false, question: false }); diag('spin+', { r: key.slice(-6) }); }
+        rec.idleAt = 0; rec.seen = now; rec.title = rowLabel(row); rec.current = !!row.querySelector('[aria-current="page"]'); rec.question = false;
         return;
       }
       if (!rec) return;
       rec.seen = now;
+      rec.title = rowLabel(row);
+      rec.current = !!row.querySelector('[aria-current="page"]');
+      if (rowHasQuestion(row)) { rowDone.delete(key); rec.idleAt = 0; rec.question = true; return; }
+      rec.question = false;
       if (!rec.idleAt) { rec.idleAt = now; diag('spin-', { r: key.slice(-6) }); }
       if (now - rec.idleAt < 2000) return;
       rowBusy.delete(key);
@@ -617,6 +807,7 @@
         const o = {
           key: row.getAttribute('data-row-key').slice(-12), label: rowLabel(row), current: !!row.querySelector('[aria-current="page"]'),
           spinner: !!row.querySelector(BUSY_SEL),
+          question: rowHasQuestion(row),
           cds: all.filter((e) => e.hasAttribute('data-cds')).map((e) => e.getAttribute('data-cds') + (e.textContent.trim() ? '«' + visChars(e.textContent.trim()) + '»' : '')).join(' '),
           aria: all.filter((e) => e.matches('[aria-busy],[role=progressbar],[role=status],svg')).length,
           anim: all.map((e) => getComputedStyle(e).animationName).filter((a) => a && a !== 'none').join(' ')
@@ -633,8 +824,10 @@
     const now = Date.now();
     if (lastTick && now - lastTick > 3000) diag('tick-gap', { s: Math.round((now - lastTick) / 1000) }); // timer throttled or tab frozen
     lastTick = now;
+    detectQuestions();
     detectResponseDone();
     detectRowsDone();
+    if (statusNoteUntil && now > statusNoteUntil) setNote('');
     const limitUI = findLimitCardAndTryAgainBtn();
 
     // If a limit card is visible and API reset timestamp is unknown, parse it from card text
@@ -649,13 +842,14 @@
 
     if (resetTs) {
       const diffMs = resetTs - now;
+      if (diffMs > 60000 && state.statusNote.includes('<1 min')) setNote('');
 
       // 1) Alert 1 minute (60s) before session reset
       if (diffMs > 0 && diffMs <= 60 * 1000 && lastPreResetSoundTs !== resetTs) {
         lastPreResetSoundTs = resetTs;
         localStorage.setItem('claude_overlay_pre_sound_ts', String(resetTs));
         claimOnce('pre-' + resetTs, 120000).then((ok) => { if (ok && cfg.soundPre) playPreResetBeep(); });
-        state.statusNote = '🔔 Session resets in <1 min!';
+        setNote('🔔 Session resets in <1 min!');
       }
 
       // 2) Alert when session recovers (0..30s window after reset)
@@ -663,7 +857,7 @@
         lastResetSoundTs = resetTs;
         localStorage.setItem('claude_overlay_reset_sound_ts', String(resetTs));
         claimOnce('reset-' + resetTs, 120000).then((ok) => { if (ok && cfg.soundReset) playSessionResetBeep(); });
-        state.statusNote = '✅ Session recovered!';
+        setNote('✅ Session recovered!');
         setTimeout(updateAll, 2000);
       }
 
@@ -679,7 +873,7 @@
           tryAgainAttemptsForCycle++;
           console.log(`[Claude Usage Overlay] Auto-clicking "Try again" (attempt ${tryAgainAttemptsForCycle}/3)`);
           limitUI.btn.click();
-          state.statusNote = `🔄 Clicked "Try again" (${tryAgainAttemptsForCycle}/3)`;
+          setNote(`🔄 Clicked "Try again" (${tryAgainAttemptsForCycle}/3)`);
         }
       }
     }
@@ -730,6 +924,7 @@
     `;
   }
 
+  let overlayPointerDown = false, pendingRender = false, lastRenderHtml = '';
   function renderOverlay() {
     applyTitle();
     const el = document.getElementById('claude-usage-overlay');
@@ -737,106 +932,148 @@
 
     const isCritical = (state.hasContextUI && state.contextPct >= cfg.threshold) ||
                        (parseInt(state.sessionPct, 10) >= 90);
+    el.classList.toggle('claude-overlay-critical', isCritical);
+    el.classList.toggle('claude-overlay-question', qActive);
 
-    if (isCritical) {
-      el.classList.add('claude-overlay-critical');
-    } else {
-      el.classList.remove('claude-overlay-critical');
-    }
+    if (overlayPointerDown) { pendingRender = true; return; }
 
-    if (state.error) {
-      el.innerHTML = `
-        <div style="font-weight:bold;color:#ff6b6b">⚠️ Claude API Error</div>
+    el.style.minWidth = cfg.minimized ? 'auto' : '220px';
+    el.style.padding = cfg.minimized ? '5px 10px' : '10px 14px';
+
+    let html = '';
+    if (cfg.minimized) {
+      const sTxt = state.sessionPct === '?' ? '?' : `${state.sessionPct}%`;
+      const wTxt = state.weeklyPct === '?' ? '?' : `${state.weeklyPct}%`;
+      const cTxt = state.hasContextUI ? ` · Ctx: <b style="color:${getColorForPct(state.contextPct)}">${state.contextPct}%</b>` : '';
+      const pill = state.error
+        ? `<span style="color:#ff6b6b;font-weight:bold;">⚠️ API Error</span>`
+        : `<span>🤖 5h: <b style="color:${getColorForPct(state.sessionPct)}">${sTxt}</b> · 7d: <b style="color:${getColorForPct(state.weeklyPct)}">${wTxt}</b>${cTxt}</span>`;
+      html = `<div style="display:flex;align-items:center;gap:8px;white-space:nowrap;font-size:11px;">
+        ${pill}
+        <span style="display:inline-flex;align-items:center;gap:6px;margin-left:auto;">
+          <span id="claude-min-btn" title="Expand" style="cursor:pointer;font-size:13px;font-weight:bold;padding:0 2px;">+</span>
+          <span id="claude-cfg-btn" title="Settings" style="cursor:pointer;font-size:13px;font-weight:normal;">⚙</span>
+        </span>
+      </div>`;
+    } else if (state.error) {
+      html = `
+        <div style="font-weight:bold;margin-bottom:4px;display:flex;justify-content:space-between;align-items:center;">
+          <span style="color:#ff6b6b">⚠️ Claude API Error</span>
+          <span style="display:inline-flex;align-items:center;gap:6px;">
+            <span id="claude-min-btn" title="Minimize" style="cursor:pointer;font-size:13px;font-weight:bold;padding:0 2px;">–</span>
+            <span id="claude-cfg-btn" title="Settings" style="cursor:pointer;font-size:13px;font-weight:normal;">⚙</span>
+          </span>
+        </div>
         <div style="font-size:10px;color:#aaa">Last attempt: ${esc(state.lastTry || 'now')}</div>
       `;
-      return;
-    }
+    } else {
+      const alertBanner = (state.hasContextUI && state.contextPct >= cfg.threshold)
+        ? `<div style="background:#d32f2f;color:#fff;font-weight:bold;font-size:10px;padding:3px 6px;border-radius:4px;margin-bottom:6px;text-align:center;">
+             🚨 WARNING: CONTEXT ${state.contextPct}% (>=${cfg.threshold}%)
+           </div>`
+        : '';
 
-    const alertBanner = (state.hasContextUI && state.contextPct >= cfg.threshold)
-      ? `<div style="background:#d32f2f;color:#fff;font-weight:bold;font-size:10px;padding:3px 6px;border-radius:4px;margin-bottom:6px;text-align:center;">
-           🚨 WARNING: CONTEXT ${state.contextPct}% (>=${cfg.threshold}%)
-         </div>`
-      : '';
+      const statusBanner = state.statusNote
+        ? `<div style="background:#1b3a28;color:#81c784;border:1px solid #2e7d32;font-size:10px;padding:3px 6px;border-radius:4px;margin-bottom:6px;text-align:center;">
+             ${esc(state.statusNote)}
+           </div>`
+        : '';
 
-    const statusBanner = state.statusNote
-      ? `<div style="background:#1b3a28;color:#81c784;border:1px solid #2e7d32;font-size:10px;padding:3px 6px;border-radius:4px;margin-bottom:6px;text-align:center;">
-           ${esc(state.statusNote)}
-         </div>`
-      : '';
+      const perm = 'Notification' in window ? Notification.permission : 'granted';
+      const permBanner = (cfg.doneNotify && perm !== 'granted')
+        ? `<div style="background:#3a2a1b;color:#ffb74d;border:1px solid #8d5a1e;font-size:10px;padding:3px 6px;border-radius:4px;margin-bottom:6px;text-align:center;">
+             🔕 ${perm === 'denied' ? 'notifications blocked (🔒 near URL → Allow)' : 'click here to enable notifications'}
+           </div>`
+        : '';
 
-    const perm = 'Notification' in window ? Notification.permission : 'granted';
-    const permBanner = (cfg.doneNotify && perm !== 'granted')
-      ? `<div style="background:#3a2a1b;color:#ffb74d;border:1px solid #8d5a1e;font-size:10px;padding:3px 6px;border-radius:4px;margin-bottom:6px;text-align:center;">
-           🔕 ${perm === 'denied' ? 'notifications blocked (🔒 near URL → Allow)' : 'click here to enable notifications'}
-         </div>`
-      : '';
-
-    const contextSection = state.hasContextUI
-      ? `
-        <div style="margin-bottom:6px;padding-bottom:6px;border-bottom:1px solid #333;">
-          <div style="display:flex;justify-content:space-between;align-items:center;">
-            <span>🧠 <b>Context (1M):</b></span>
-            <b style="color:${getColorForPct(state.contextPct)};font-size:13px;">${state.contextPct}%</b>
+      const contextSection = state.hasContextUI
+        ? `
+          <div style="margin-bottom:6px;padding-bottom:6px;border-bottom:1px solid #333;">
+            <div style="display:flex;justify-content:space-between;align-items:center;">
+              <span>🧠 <b>Context (1M):</b></span>
+              <b style="color:${getColorForPct(state.contextPct)};font-size:13px;">${state.contextPct}%</b>
+            </div>
+            ${renderProgressBar(state.contextPct)}
+            <div style="font-size:10px;color:#aaa;text-align:right;">
+              <span>${esc(state.contextText)}</span>
+            </div>
           </div>
-          ${renderProgressBar(state.contextPct)}
-          <div style="font-size:10px;color:#aaa;text-align:right;">
-            <span>${esc(state.contextText)}</span>
+        `
+        : `
+          <div style="margin-bottom:6px;padding-bottom:6px;border-bottom:1px solid #333;font-size:11px;color:#888;">
+            🧠 Context: <i>Open Context panel in Claude</i>
           </div>
+        `;
+
+      html = `
+        ${alertBanner}
+        ${statusBanner}
+        ${permBanner}
+        <div style="font-weight:bold;margin-bottom:6px;display:flex;justify-content:space-between;align-items:center;border-bottom:1px solid #333;padding-bottom:4px;">
+          <span>📊 Claude Monitor</span>
+          <span style="display:inline-flex;align-items:center;gap:6px;">
+            <span id="claude-min-btn" title="Minimize" style="cursor:pointer;font-size:13px;font-weight:bold;padding:0 2px;">–</span>
+            <span id="claude-cfg-btn" title="Settings" style="cursor:pointer;font-size:13px;font-weight:normal;">⚙</span>
+          </span>
         </div>
-      `
-      : `
-        <div style="margin-bottom:6px;padding-bottom:6px;border-bottom:1px solid #333;font-size:11px;color:#888;">
-          🧠 Context: <i>Open Context panel in Claude</i>
+
+        ${contextSection}
+
+        <div style="display:flex;justify-content:space-between;">
+          <span>🕐 Session (5h):</span>
+          <b style="color:${getColorForPct(state.sessionPct)}">${state.sessionPct}%</b>
+        </div>
+        ${renderProgressBar(state.sessionPct)}
+        <div style="font-size:10px;color:#aaa;margin-bottom:6px">${formatResetTime(state.sessionResetTs, true)}</div>
+        ${fcHtml('session')}
+
+        <div style="display:flex;justify-content:space-between;">
+          <span>📅 Weekly (7d):</span>
+          <b style="color:${getColorForPct(state.weeklyPct)}">${state.weeklyPct}%</b>
+        </div>
+        ${renderProgressBar(state.weeklyPct)}
+        <div style="font-size:10px;color:#aaa;margin-bottom:6px">${formatResetTime(state.weeklyResetTs, false)}</div>
+        ${fcHtml('weekly')}
+        ${sessionsHtml()}
+
+        <div style="border-top:1px solid #333;padding-top:5px;margin-top:4px;display:flex;justify-content:space-between;align-items:center;font-size:10px;">
+          <label style="display:flex;align-items:center;gap:5px;cursor:pointer;color:#ccc;" title="Automatically clicks 'Try again' after limit reset">
+            <input id="claude-auto-try-again-cb" type="checkbox" ${state.autoTryAgain ? 'checked' : ''} style="cursor:pointer;margin:0;">
+            <span>Auto-click "Try again"</span>
+          </label>
+          <button id="claude-test-sound-btn" type="button" title="Test reset sound" style="background:#2d2d2d;color:#bbb;border:1px solid #444;border-radius:4px;padding:1px 5px;font-size:9px;cursor:pointer;">
+            🔊 Test
+          </button>
+        </div>
+
+        <div style="font-size:9px;color:#666;margin-top:5px;border-top:1px solid #333;padding-top:4px;display:flex;justify-content:space-between;">
+          <span>Auto: ${cfg.refreshSec}s · v${VERSION}</span>
+          <span ${state.stale ? 'style="color:#ff8a80" title="Last API request failed (attempt ' + esc(state.lastTry) + ')"' : ''}>Status: ${esc(state.lastUpdated) || '...'}${state.stale ? ' ⚠ stale' : ''}</span>
         </div>
       `;
+    }
 
-    el.innerHTML = `
-      ${alertBanner}
-      ${statusBanner}
-      ${permBanner}
-      <div style="font-weight:bold;margin-bottom:6px;display:flex;justify-content:space-between;align-items:center;border-bottom:1px solid #333;padding-bottom:4px;">
-        <span>📊 Claude Monitor</span>
-        <span id="claude-cfg-btn" title="Settings" style="cursor:pointer;font-size:13px;font-weight:normal;">⚙</span>
-      </div>
+    if (html === lastRenderHtml) return;
+    lastRenderHtml = html;
+    el.innerHTML = html;
 
-      ${contextSection}
+    // Bind events for minimize, settings, checkbox, and sound test buttons
+    const minBtn = document.getElementById('claude-min-btn');
+    if (minBtn) {
+      minBtn.onpointerdown = (e) => { e.stopPropagation(); e.preventDefault(); };
+      minBtn.onclick = (e) => {
+        e.stopPropagation();
+        cfg.minimized = !cfg.minimized;
+        try { localStorage.setItem('claude_overlay_cfg_v1', JSON.stringify(cfg)); } catch (err) {}
+        renderOverlay();
+      };
+    }
 
-      <div style="display:flex;justify-content:space-between;">
-        <span>🕐 Session (5h):</span>
-        <b style="color:${getColorForPct(state.sessionPct)}">${state.sessionPct}%</b>
-      </div>
-      ${renderProgressBar(state.sessionPct)}
-      <div style="font-size:10px;color:#aaa;margin-bottom:6px">${formatResetTime(state.sessionResetTs, true)}</div>
-      ${fcHtml('session')}
-
-      <div style="display:flex;justify-content:space-between;">
-        <span>📅 Weekly (7d):</span>
-        <b style="color:${getColorForPct(state.weeklyPct)}">${state.weeklyPct}%</b>
-      </div>
-      ${renderProgressBar(state.weeklyPct)}
-      <div style="font-size:10px;color:#aaa;margin-bottom:6px">${formatResetTime(state.weeklyResetTs, false)}</div>
-      ${fcHtml('weekly')}
-      ${sessionsHtml()}
-
-      <div style="border-top:1px solid #333;padding-top:5px;margin-top:4px;display:flex;justify-content:space-between;align-items:center;font-size:10px;">
-        <label style="display:flex;align-items:center;gap:5px;cursor:pointer;color:#ccc;" title="Automatically clicks 'Try again' after limit reset">
-          <input id="claude-auto-try-again-cb" type="checkbox" ${state.autoTryAgain ? 'checked' : ''} style="cursor:pointer;margin:0;">
-          <span>Auto-click "Try again"</span>
-        </label>
-        <button id="claude-test-sound-btn" type="button" title="Test reset sound" style="background:#2d2d2d;color:#bbb;border:1px solid #444;border-radius:4px;padding:1px 5px;font-size:9px;cursor:pointer;">
-          🔊 Test
-        </button>
-      </div>
-
-      <div style="font-size:9px;color:#666;margin-top:5px;border-top:1px solid #333;padding-top:4px;display:flex;justify-content:space-between;">
-        <span>Auto: ${cfg.refreshSec}s</span>
-        <span ${state.stale ? 'style="color:#ff8a80" title="Last API request failed (attempt ' + esc(state.lastTry) + ')"' : ''}>Status: ${esc(state.lastUpdated) || '...'}${state.stale ? ' ⚠ stale' : ''}</span>
-      </div>
-    `;
-
-    // Bind events for settings, checkbox, and sound test buttons
     const gearBtn = document.getElementById('claude-cfg-btn');
-    if (gearBtn) gearBtn.onpointerdown = (e) => { e.stopPropagation(); e.preventDefault(); askNotifyPermission(); openSettings(); };
+    if (gearBtn) {
+      gearBtn.onpointerdown = (e) => { e.stopPropagation(); e.preventDefault(); };
+      gearBtn.onclick = (e) => { e.stopPropagation(); askNotifyPermission(); openSettings(); };
+    }
 
     const cb = document.getElementById('claude-auto-try-again-cb');
     if (cb) {
@@ -873,7 +1110,7 @@
 
     let drag = null, moved = false;
     el.addEventListener('pointerdown', (e) => {
-      if (e.button !== 0 || e.target.closest('input,label,button,[data-sess]')) return; // pointer capture would swallow clicks
+      if (e.button !== 0 || e.target.closest('input,label,button,[data-sess],#claude-cfg-btn,#claude-min-btn')) return; // pointer capture would swallow clicks
       const r = el.getBoundingClientRect();
       drag = { dx: e.clientX - r.left, dy: e.clientY - r.top, sx: e.clientX, sy: e.clientY };
       moved = false;
@@ -910,9 +1147,34 @@
 
     const t = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
     try {
+      const prevResetTs = state.sessionResetTs;
       const usageData = await fetchUsageFromApi();
       backoffMs = 0; apiBlockedUntil = 0;
       Object.assign(state, usageData, { error: false, stale: false, lastUpdated: t });
+      const now = Date.now();
+      lastSuccessTs = now;
+      const rolledOver = (state.sessionResetTs && state.sessionResetTs > prevResetTs + 60000) ||
+        (!state.sessionResetTs && now >= prevResetTs && state.sessionPct === 0);
+      if (prevResetTs && Math.abs(now - prevResetTs) < 90000 && rolledOver && lastResetSoundTs !== prevResetTs) {
+        lastResetSoundTs = prevResetTs;
+        try { localStorage.setItem('claude_overlay_reset_sound_ts', String(prevResetTs)); } catch (e) {}
+        claimOnce('reset-' + prevResetTs, 120000).then((ok) => { if (ok && cfg.soundReset) playSessionResetBeep(); });
+        setNote('✅ Session recovered!');
+      }
+      try {
+        localStorage.setItem(STATE_KEY, JSON.stringify({
+          sessionPct: state.sessionPct,
+          sessionResetTs: state.sessionResetTs,
+          weeklyPct: state.weeklyPct,
+          weeklyResetTs: state.weeklyResetTs,
+          extraEnabled: state.extraEnabled,
+          extraPct: state.extraPct,
+          extraUsed: state.extraUsed,
+          extraLimit: state.extraLimit,
+          lastUpdated: state.lastUpdated,
+          fetchedAt: now
+        }));
+      } catch (e) {}
       recordHist('session', state.sessionPct); recordHist('weekly', state.weeklyPct);
       checkForecast();
     } catch (err) {
@@ -947,8 +1209,19 @@
     `;
     overlay.textContent = 'Loading monitor...';
     overlay.title = 'Click overlay background to refresh manually; drag to move';
+    overlay.addEventListener('pointerdown', () => { overlayPointerDown = true; }, true);
+    const clearPointerDown = () => {
+      if (!overlayPointerDown) return;
+      overlayPointerDown = false;
+      if (pendingRender) {
+        pendingRender = false;
+        setTimeout(() => { if (!overlayPointerDown) renderOverlay(); }, 0);
+      }
+    };
+    ['pointerup', 'pointercancel', 'mouseleave'].forEach((ev) => overlay.addEventListener(ev, clearPointerDown));
+    ['pointerup', 'pointercancel'].forEach((ev) => window.addEventListener(ev, clearPointerDown));
     overlay.onclick = (e) => {
-      if (e.target.closest('input, label, button, [data-sess]')) return;
+      if (e.target.closest('input, label, button, [data-sess], #claude-cfg-btn, #claude-min-btn')) return;
       askNotifyPermission();
       updateAll(true);
     };
@@ -965,7 +1238,14 @@
     updateAll();
     applyCfg();
     // Background tab polls API at most once per minute (needed for % in title); refreshes immediately on return.
-    (function loopApi() { setTimeout(() => { if (!document.hidden || Date.now() - lastApiAt >= 60000) updateAll(); loopApi(); }, Math.max(2, cfg.refreshSec) * 1000); })();
+    (function loopApi() {
+      setTimeout(() => {
+        const hiddenThrottle = document.hidden && Date.now() - lastApiAt < 60000;
+        const sharedFresh = Date.now() - lastSuccessTs < Math.max(0, cfg.refreshSec - 2) * 1000;
+        if (!hiddenThrottle && !sharedFresh) updateAll();
+        loopApi();
+      }, Math.max(2, cfg.refreshSec) * 1000);
+    })();
     document.addEventListener('visibilitychange', () => { diag('vis'); if (!document.hidden) { clearDone(); updateAll(); } });
     ['pointerdown', 'keydown', 'focus'].forEach((ev) => window.addEventListener(ev, clearDone, true));
     // Page itself updates <title> (SPA) — re-apply our prefix
@@ -976,7 +1256,7 @@
     const schedDet = (ms) => { if (!detT) detT = setTimeout(runDet, ms); };
     function runDet() {
       detT = 0;
-      detectResponseDone(); detectRowsDone(); applyTitle();
+      detectQuestions(); detectResponseDone(); detectRowsDone(); applyTitle();
       if (genIdleAt || [...rowBusy.values()].some((r) => r.idleAt)) schedDet(2100);
     }
     try {
@@ -984,7 +1264,7 @@
         if (!recs.some((m) => !overlay.contains(m.target))) return; // skip our own 1s renders
         if (document.hidden) { mutHid++; const n = Date.now(); if (n - mutHidAt > 30000) { diag('mut-hidden', { c: mutHid }); mutHidAt = n; mutHid = 0; } }
         schedDet(500);
-      }).observe(document.body, { subtree: true, childList: true, attributes: true, attributeFilter: ['data-cds', 'data-is-streaming', 'aria-label', 'aria-current'] });
+      }).observe(document.body, { subtree: true, childList: true, attributes: true, attributeFilter: ['data-cds', 'data-is-streaming', 'aria-label', 'aria-current', 'data-testid'] });
     } catch (e) {}
     setInterval(handleTimersAndAutoClick, TICK_INTERVAL_MS);
   }
