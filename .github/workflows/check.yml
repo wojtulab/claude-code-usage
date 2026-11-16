@@ -1,0 +1,37 @@
+name: Check Userscript
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - name: Syntax check
+        run: node --check claude-usage.user.js
+      - name: Metadata and @grant none checks
+        run: |
+          node -e '
+            const fs = require("fs");
+            const s = fs.readFileSync("claude-usage.user.js", "utf8");
+            const hdr = s.match(/\/\/ ==UserScript==[\s\S]*?\/\/ ==\/UserScript==/);
+            if (!hdr) throw new Error("Missing ==UserScript== header");
+            const h = hdr[0];
+            for (const tag of ["@name", "@version", "@homepageURL", "@updateURL", "@downloadURL", "@license"]) {
+              if (!h.includes(tag)) throw new Error("Missing header tag: " + tag);
+            }
+            if (!/@grant\s+none\b/.test(h)) throw new Error("Script must keep @grant none");
+            const body = s.slice(hdr[0].length);
+            if (/\b(?:GM_|unsafeWindow\b)/.test(body)) throw new Error("GM_* / unsafeWindow found while @grant none is set");
+            console.log("OK:", /@version\s+(\S+)/.exec(h)[1]);
+          '

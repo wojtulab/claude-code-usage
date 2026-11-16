@@ -1,0 +1,36 @@
+name: Bug Report / DOM Change
+description: Report a bug or selector issue on claude.ai / claude.ai/code
+title: "[Bug]: "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting! If Claude.ai changed its DOM (e.g., running indicator or Stop button stopped triggering), please include the console diagnostics below.
+  - type: input
+    id: env
+    attributes:
+      label: Browser & Userscript Manager
+      placeholder: "e.g. Chrome 131 + Tampermonkey 5.3 / Firefox + Violentmonkey"
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: Script Version
+      placeholder: "e.g. 2.11.1"
+    validations:
+      required: true
+  - type: textarea
+    id: description
+    attributes:
+      label: What happened?
+      description: Describe the expected vs actual behavior (e.g., background tab alert didn't fire, context bar missing, wrong title counter).
+    validations:
+      required: true
+  - type: textarea
+    id: diag
+    attributes:
+      label: Console output (`__claudeDiag()` / `__claudeDumpRows()`)
+      description: "Optional but super helpful: open DevTools (F12 → Console) on claude.ai, run `copy(JSON.stringify(__claudeDiag().slice(-30)))` or `__claudeDumpRows()` and paste here. Please remove any session titles you don't want public."
+      render: json
