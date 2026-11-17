@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Claude.ai Usage & Context Overlay (DOM Sync v2.2)
 // @namespace    https://github.com/wojtulab/claude-code-usage
-// @version      2.12.0
+// @version      2.12.1
 // @description  Monitor Claude.ai 1M context and 5h/7d usage limits, sound/browser alerts before & after reset or response completion, and auto-click "Try again".
 // @homepageURL  https://github.com/wojtulab/claude-code-usage
 // @supportURL   https://github.com/wojtulab/claude-code-usage/issues
@@ -16,7 +16,7 @@
 (function () {
   'use strict';
 
-  const VERSION = '2.12.0';
+  const VERSION = '2.12.1';
   const TICK_INTERVAL_MS = 1000;             // Countdown, alerts, and button checks every 1s
 
   // Settings: ⚙ panel in overlay header, saved to localStorage (claude_overlay_cfg_v1). CFG_SCHEMA entries: [key, label, type, default].
@@ -944,14 +944,13 @@
     if (cfg.minimized) {
       const sTxt = state.sessionPct === '?' ? '?' : `${state.sessionPct}%`;
       const wTxt = state.weeklyPct === '?' ? '?' : `${state.weeklyPct}%`;
-      const cTxt = state.hasContextUI ? ` · Ctx: <b style="color:${getColorForPct(state.contextPct)}">${state.contextPct}%</b>` : '';
       const pill = state.error
         ? `<span style="color:#ff6b6b;font-weight:bold;">⚠️ API Error</span>`
-        : `<span>🤖 5h: <b style="color:${getColorForPct(state.sessionPct)}">${sTxt}</b> · 7d: <b style="color:${getColorForPct(state.weeklyPct)}">${wTxt}</b>${cTxt}</span>`;
+        : `<span>📊 Weekly: <b style="color:${getColorForPct(state.weeklyPct)}">${wTxt}</b> · 5h: <b style="color:${getColorForPct(state.sessionPct)}">${sTxt}</b></span>`;
       html = `<div style="display:flex;align-items:center;gap:8px;white-space:nowrap;font-size:11px;">
         ${pill}
         <span style="display:inline-flex;align-items:center;gap:6px;margin-left:auto;">
-          <span id="claude-min-btn" title="Expand" style="cursor:pointer;font-size:13px;font-weight:bold;padding:0 2px;">+</span>
+          <span id="claude-min-btn" title="Expand" style="cursor:pointer;font-size:13px;font-weight:bold;padding:0 3px;color:#ccc;">+</span>
           <span id="claude-cfg-btn" title="Settings" style="cursor:pointer;font-size:13px;font-weight:normal;">⚙</span>
         </span>
       </div>`;

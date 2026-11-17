@@ -8,7 +8,7 @@
   <a href="https://raw.githubusercontent.com/wojtulab/claude-code-usage/main/claude-usage.user.js">
     <img src="https://img.shields.io/badge/Install%20with-Tampermonkey-00485B?style=for-the-badge&logo=tampermonkey&logoColor=white" alt="Install with Tampermonkey">
   </a>
-  <img src="https://img.shields.io/badge/version-2.12.0-blue?style=for-the-badge" alt="Version 2.12.0">
+  <img src="https://img.shields.io/badge/version-2.12.1-blue?style=for-the-badge" alt="Version 2.12.1">
   <img src="https://img.shields.io/badge/license-MIT-green?style=for-the-badge" alt="MIT License">
   <img src="https://img.shields.io/badge/grant-none%20(zero%20sandbox)-lightgrey?style=for-the-badge" alt="Grant none">
 </p>
@@ -40,7 +40,7 @@ A lightweight, zero-dependency Tampermonkey / Violentmonkey userscript for **cla
   - When a background session completes, the tab blinks `✅` and switches the favicon to a bright **green dot** (`#22c55e`, static SVG data URI — works even when Chrome throttles background timers, and also triggers when the browser window is unfocused on a second monitor).
   - Automatically clears and restores your favicon as soon as you switch back, focus, click, or press a key.
 - **Compact Mini-Mode (`–` / `+`) & Stable Controls**
-  - Collapse the overlay to a single-line pill (`🤖 5h: 41% · 7d: 12%`) via `–`/`+` in the header (saved in `claude_overlay_cfg_v1`).
+  - Collapse the overlay to a compact pill (`📊 Weekly: 12% · 5h: 41%`) via `–`/`+` in the header (saved in `claude_overlay_cfg_v1`).
   - Pauses DOM rebuilds while holding down a click on checkboxes/buttons (`overlayPointerDown`) and skips redundant re-renders so 1s countdown updates never swallow clicks.
   - Settings panel (`⚙`) adapts to screen edges and closes on `Escape` or clicking outside.
 - **Live Session List (`claude.ai/code`) & Click-to-Jump**
