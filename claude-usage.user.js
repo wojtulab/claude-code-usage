@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Claude.ai Usage & Context Overlay (DOM Sync v2.2)
 // @namespace    https://github.com/wojtulab/claude-code-usage
-// @version      2.12.3
+// @version      2.12.4
 // @description  Monitor Claude.ai 1M context and 5h/7d usage limits, sound/browser alerts before & after reset or response completion, and auto-click "Try again".
 // @homepageURL  https://github.com/wojtulab/claude-code-usage
 // @supportURL   https://github.com/wojtulab/claude-code-usage/issues
@@ -16,7 +16,7 @@
 (function () {
   'use strict';
 
-  const VERSION = '2.12.3';
+  const VERSION = '2.12.4';
   const TICK_INTERVAL_MS = 1000;             // Countdown, alerts, and button checks every 1s
 
   // Settings: ⚙ panel in overlay header, saved to localStorage (claude_overlay_cfg_v1). CFG_SCHEMA entries: [key, label, type, default].
@@ -33,6 +33,7 @@
     ['doneMinSec', 'Response ready: min generation time (s)', 'num', 10],
     ['fcMin', 'Forecast: alert if limit ends within (min, 0 = off)', 'num', 30],
     ['sessList', 'Session list in overlay (claude.ai/code)', 'bool', true],
+    ['autoAllow', 'Auto-click "Allow once" (permission)', 'bool', false],
     ['titleInfo', 'Tab title: busy state and %', 'bool', true],
     ['titlePct', 'Tab title %', 'select', 'session', [['session', 'Session (5h)'], ['weekly', 'Weekly (7d)'], ['off', 'Off']]],
     ['titleBlink', 'Response ready: blink ✅ in title + green icon (silent)', 'bool', true],
@@ -43,6 +44,7 @@
   const cfg = Object.assign({ minimized: false }, Object.fromEntries(CFG_SCHEMA.map((s) => [s[0], s[3]])));
   try { Object.assign(cfg, JSON.parse(localStorage.getItem('claude_overlay_cfg_v1')) || {}); } catch (e) {}
   cfg.minimized = !!cfg.minimized;
+  cfg.autoAllow = !!cfg.autoAllow;
   if (!['session', 'weekly', 'off'].includes(cfg.titlePct)) cfg.titlePct = 'session';
 
   function applyCfg() {
@@ -85,6 +87,7 @@
         if (type === 'bool' && i.checked && /Notify$/.test(k)) askNotifyPermission();
         try { localStorage.setItem('claude_overlay_cfg_v1', JSON.stringify(cfg)); } catch (e) {}
         applyCfg();
+        if (k === 'autoAllow' && cfg.autoAllow) tryAutoAllow();
         renderOverlay();
       };
       row.append(t, i);
@@ -513,7 +516,7 @@
   // % = 5h session usage. Strip prefix before re-applying so page title updates don't loop.
   const TITLE_PREFIX_RE = /^(?:(?:❓|✅)\d*\s+)?(?:🔄\d*\s+)?(?:\d{1,3}% · )?/;
   const QUESTION_ATTRS = ['permission', 'approve', 'allow', 'confirm', 'waiting for input', 'waiting-for-input', 'waiting_for_input', 'question'];
-  const QUESTION_SEL = QUESTION_ATTRS.flatMap((w) => [`[aria-label*="${w}" i]`, `[data-testid*="${w}" i]`]).join(', ');
+  const QUESTION_SEL = ['[data-approval-allow]', ...QUESTION_ATTRS.flatMap((w) => [`[aria-label*="${w}" i]`, `[data-testid*="${w}" i]`])].join(', ');
   const qMap = new Map(); // key → { title, current }
   let titleDone = false, qActive = false, qBlink = false;
   function isQuestionEl(el) {
@@ -554,6 +557,53 @@
     }
     return null;
   }
+  const allowClicks = new WeakMap();
+  let lastAutoAllowAt = 0;
+  function cleanBtnText(btn) {
+    if (!btn.querySelector('kbd, [data-cds="Shortcut"], .sr-only')) return (btn.textContent || '').replace(/\s+/g, ' ').trim();
+    const c = btn.cloneNode(true);
+    c.querySelectorAll('kbd, [data-cds="Shortcut"], .sr-only').forEach((n) => n.remove());
+    return (c.textContent || '').replace(/\s+/g, ' ').trim();
+  }
+  function findAllowOnceBtn() {
+    const scopes = document.querySelectorAll('main, [role="main"], [role="dialog"], [role="alertdialog"]');
+    const roots = scopes.length ? scopes : (document.body ? [document.body] : []);
+    const okBtn = (btn) => isQuestionEl(btn) && btn.getAttribute('aria-disabled') !== 'true' && !btn.closest('[data-row-key], nav');
+    for (const scope of roots) {
+      for (const btn of scope.querySelectorAll('[data-approval-allow] button[data-approval-primary], [data-approval-allow] button')) {
+        if (okBtn(btn) && /^Allow(?:\s+once)?$/i.test(cleanBtnText(btn))) return btn;
+      }
+      for (const btn of scope.querySelectorAll('button, [role="button"]')) {
+        if (!okBtn(btn)) continue;
+        const txt = cleanBtnText(btn);
+        const al = (btn.getAttribute('aria-label') || '').replace(/\s+/g, ' ').trim();
+        if (/^Allow\s+once(?:\s*(?:Ctrl|⌘|Enter|⏎|↵).*)?$/i.test(txt) || /^Allow\s+once\b/i.test(al)) return btn;
+        if (/^Allow(?:\s*(?:Ctrl|⌘|Enter|⏎|↵).*)?$/i.test(txt) && btn.parentElement) {
+          const hasDeny = [...btn.parentElement.querySelectorAll('button, [role="button"]')].some((b) =>
+            b !== btn && isQuestionEl(b) && /^(?:Deny|Reject|Decline|Don'?t allow)\b/i.test(cleanBtnText(b))
+          );
+          if (hasDeny) return btn;
+        }
+      }
+    }
+    return null;
+  }
+  function tryAutoAllow() {
+    if (!cfg.autoAllow) return false;
+    const now = Date.now();
+    if (now - lastAutoAllowAt < 800) return false;
+    const btn = findAllowOnceBtn();
+    if (!btn) return false;
+    const rec = allowClicks.get(btn) || { count: 0, at: 0 };
+    if (rec.count >= 2 || now - rec.at < 3000) return false;
+    allowClicks.set(btn, { count: rec.count + 1, at: now });
+    lastAutoAllowAt = now;
+    diag('auto-allow');
+    btn.click();
+    setNote('🤖 Auto-clicked "Allow once"', 10000);
+    renderOverlay();
+    return true;
+  }
   function detectQuestions() {
     const active = new Map();
     let curRowHasQ = false;
@@ -565,7 +615,7 @@
       rowDone.delete(key);
       active.set(key, { title: rowLabel(row) || key, current });
     });
-    if (!curRowHasQ && findChatQuestion()) {
+    if (!curRowHasQ && !(cfg.autoAllow && Date.now() - lastAutoAllowAt < 2500) && findChatQuestion()) {
       const chatTitle = document.title.replace(TITLE_PREFIX_RE, '').replace(/\s*[-–|]\s*Claude\s*$/i, '') || 'Claude';
       active.set('chat', { title: chatTitle, current: true });
     }
@@ -687,6 +737,18 @@
       if (e.key === 'claude_overlay_pre_sound_ts') lastPreResetSoundTs = Number(e.newValue) || 0;
       else if (e.key === 'claude_overlay_reset_sound_ts') lastResetSoundTs = Number(e.newValue) || 0;
       else if (e.key === 'claude_overlay_fc_v1') fcAlerted = JSON.parse(e.newValue) || {};
+      else if (e.key === 'claude_overlay_cfg_v1' && e.newValue) {
+        const c = JSON.parse(e.newValue);
+        if (c && typeof c === 'object') {
+          Object.assign(cfg, c);
+          cfg.minimized = !!cfg.minimized;
+          cfg.autoAllow = !!cfg.autoAllow;
+          if (!['session', 'weekly', 'off'].includes(cfg.titlePct)) cfg.titlePct = 'session';
+          applyCfg();
+          if (cfg.autoAllow) tryAutoAllow();
+          renderOverlay();
+        }
+      }
       else if (e.key === STATE_KEY && e.newValue) {
         const d = sanitizeSharedState(JSON.parse(e.newValue));
         if (d) {
@@ -836,6 +898,7 @@
     const now = Date.now();
     if (lastTick && now - lastTick > 3000) diag('tick-gap', { s: Math.round((now - lastTick) / 1000) }); // timer throttled or tab frozen
     lastTick = now;
+    tryAutoAllow();
     detectQuestions();
     detectResponseDone();
     detectRowsDone();
@@ -1051,14 +1114,20 @@
         ${fcHtml('weekly')}
         ${sessionsHtml()}
 
-        <div style="border-top:1px solid #333;padding-top:5px;margin-top:4px;display:flex;justify-content:space-between;align-items:center;font-size:10px;">
-          <label style="display:flex;align-items:center;gap:5px;cursor:pointer;color:#ccc;" title="Automatically clicks 'Try again' after limit reset">
-            <input id="claude-auto-try-again-cb" type="checkbox" ${state.autoTryAgain ? 'checked' : ''} style="cursor:pointer;margin:0;">
-            <span>Auto-click "Try again"</span>
+        <div style="border-top:1px solid #333;padding-top:5px;margin-top:4px;">
+          <div style="display:flex;justify-content:space-between;align-items:center;font-size:10px;">
+            <label style="display:flex;align-items:center;gap:5px;cursor:pointer;color:#ccc;" title="Automatically clicks 'Try again' after limit reset">
+              <input id="claude-auto-try-again-cb" type="checkbox" ${state.autoTryAgain ? 'checked' : ''} style="cursor:pointer;margin:0;">
+              <span>Auto-click "Try again"</span>
+            </label>
+            <button id="claude-test-sound-btn" type="button" title="Test reset sound" style="background:#2d2d2d;color:#bbb;border:1px solid #444;border-radius:4px;padding:1px 5px;font-size:9px;cursor:pointer;">
+              🔊 Test
+            </button>
+          </div>
+          <label style="display:flex;align-items:center;gap:5px;cursor:pointer;color:${cfg.autoAllow ? '#ffb74d' : '#ccc'};font-size:10px;margin-top:4px;" title="Automatically clicks 'Allow once' on command/tool permission prompts (use carefully!)">
+            <input id="claude-auto-allow-cb" type="checkbox" ${cfg.autoAllow ? 'checked' : ''} style="cursor:pointer;margin:0;">
+            <span>Auto-click "Allow once"</span>
           </label>
-          <button id="claude-test-sound-btn" type="button" title="Test reset sound" style="background:#2d2d2d;color:#bbb;border:1px solid #444;border-radius:4px;padding:1px 5px;font-size:9px;cursor:pointer;">
-            🔊 Test
-          </button>
         </div>
 
         <div style="font-size:9px;color:#666;margin-top:5px;border-top:1px solid #333;padding-top:4px;display:flex;justify-content:space-between;">
@@ -1095,6 +1164,16 @@
       cb.onchange = (e) => {
         state.autoTryAgain = e.target.checked;
         localStorage.setItem('claude_overlay_auto_try_again', String(state.autoTryAgain));
+      };
+    }
+
+    const allowCb = document.getElementById('claude-auto-allow-cb');
+    if (allowCb) {
+      allowCb.onchange = (e) => {
+        cfg.autoAllow = e.target.checked;
+        try { localStorage.setItem('claude_overlay_cfg_v1', JSON.stringify(cfg)); } catch (err) {}
+        if (cfg.autoAllow) tryAutoAllow();
+        renderOverlay();
       };
     }
 
@@ -1284,7 +1363,7 @@
     const schedDet = (ms) => { if (!detT) detT = setTimeout(runDet, ms); };
     function runDet() {
       detT = 0;
-      detectQuestions(); detectResponseDone(); detectRowsDone(); applyTitle();
+      tryAutoAllow(); detectQuestions(); detectResponseDone(); detectRowsDone(); applyTitle();
       if (genIdleAt || [...rowBusy.values()].some((r) => r.idleAt)) schedDet(2100);
     }
     try {
@@ -1292,7 +1371,7 @@
         if (!recs.some((m) => !overlay.contains(m.target))) return; // skip our own 1s renders
         if (document.hidden) { mutHid++; const n = Date.now(); if (n - mutHidAt > 30000) { diag('mut-hidden', { c: mutHid }); mutHidAt = n; mutHid = 0; } }
         schedDet(500);
-      }).observe(document.body, { subtree: true, childList: true, attributes: true, attributeFilter: ['data-cds', 'data-is-streaming', 'aria-label', 'aria-current', 'data-testid'] });
+      }).observe(document.body, { subtree: true, childList: true, attributes: true, attributeFilter: ['data-cds', 'data-is-streaming', 'aria-label', 'aria-current', 'data-testid', 'data-approval-allow'] });
     } catch (e) {}
     setInterval(handleTimersAndAutoClick, TICK_INTERVAL_MS);
   }

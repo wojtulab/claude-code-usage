@@ -8,7 +8,7 @@
   <a href="https://raw.githubusercontent.com/wojtulab/claude-code-usage/main/claude-usage.user.js">
     <img src="https://img.shields.io/badge/Install%20with-Tampermonkey-00485B?style=for-the-badge&logo=tampermonkey&logoColor=white" alt="Install with Tampermonkey">
   </a>
-  <img src="https://img.shields.io/badge/version-2.12.3-blue?style=for-the-badge" alt="Version 2.12.3">
+  <img src="https://img.shields.io/badge/version-2.12.4-blue?style=for-the-badge" alt="Version 2.12.4">
   <img src="https://img.shields.io/badge/license-MIT-green?style=for-the-badge" alt="MIT License">
   <img src="https://img.shields.io/badge/grant-none%20(zero%20sandbox)-lightgrey?style=for-the-badge" alt="Grant none">
 </p>
@@ -52,8 +52,9 @@ A lightweight, zero-dependency Tampermonkey / Violentmonkey userscript for **cla
 - **Smart Audio & Sticky Notifications**
   - Single shared Web Audio API context unlocked on your first click/keypress (bypassing autoplay blocks when alerts fire from background tabs); stale signals delayed by >1.5s are dropped rather than playing late when you return.
   - Completion notifications use `requireInteraction: true` so they don't vanish before you see them, and automatically close when you return to the tab.
-- **Reset Chimes & Auto-Click "Try again"**
+- **Reset Chimes, Auto-Click "Try again" & Optional Auto-Approve ("Allow once")**
   - Plays a gentle chime 1 minute before session reset, an ascending chord on recovery, and automatically clicks **"Try again"** (up to 3 attempts) once the reset timer passes.
+  - Optional **Auto-click "Allow once"** toggle (off by default, available directly in the overlay or `⚙` settings and synced across tabs) automatically clicks Claude Code's **"Allow once"** permission prompt (`[data-approval-allow]`).
 
 ---
 
