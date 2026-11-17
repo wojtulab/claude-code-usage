@@ -8,7 +8,7 @@
   <a href="https://raw.githubusercontent.com/wojtulab/claude-code-usage/main/claude-usage.user.js">
     <img src="https://img.shields.io/badge/Install%20with-Tampermonkey-00485B?style=for-the-badge&logo=tampermonkey&logoColor=white" alt="Install with Tampermonkey">
   </a>
-  <img src="https://img.shields.io/badge/version-2.12.2-blue?style=for-the-badge" alt="Version 2.12.2">
+  <img src="https://img.shields.io/badge/version-2.12.3-blue?style=for-the-badge" alt="Version 2.12.3">
   <img src="https://img.shields.io/badge/license-MIT-green?style=for-the-badge" alt="MIT License">
   <img src="https://img.shields.io/badge/grant-none%20(zero%20sandbox)-lightgrey?style=for-the-badge" alt="Grant none">
 </p>
@@ -34,8 +34,8 @@ A lightweight, zero-dependency Tampermonkey / Violentmonkey userscript for **cla
 - **5h Session & 7d Weekly Quotas + Burn-Rate Forecast**
   - Reads live usage from `/api/organizations/<org>/usage` with automatic **429/401 exponential backoff** (up to 10 min; manual click bypasses backoff).
   - Records quota snapshots in `localStorage` and calculates your burn rate (`%/h`) over a rolling window (45 min for 5h, 6h for 7d). Warns you (`⏱ ... ⚠ before reset`) when you are on track to hit the limit before it resets.
-- **Tab Title Counters, Blinking `❓` / `✅` & Colored Favicons**
-  - Prefixes the browser tab title with live counters and 5h usage: e.g. `✅3 🔄2 41% · Claude Code`.
+- **Tab Title Counters, Configurable `%`, Blinking `❓` / `✅` & Colored Favicons**
+  - Prefixes the browser tab title with live counters and quota usage (selectable in `⚙` settings: 5h session, 7d weekly, or Off): e.g. `✅3 🔄2 41% · Claude Code`.
   - **Question / approval alerts (`❓`):** When a session or active chat waits for permission/approval/input (`QUESTION_SEL`), the overlay pulses orange, the tab blinks `❓` with an **orange favicon dot** (`#f97316`, taking priority over `✅`), and a single tab plays a chime + sticky notification (`claimOnce`).
   - When a background session completes, the tab blinks `✅` and switches the favicon to a bright **green dot** (`#22c55e`, static SVG data URI — works even when Chrome throttles background timers, and also triggers when the browser window is unfocused on a second monitor).
   - Automatically clears and restores your favicon as soon as you switch back, focus, click, or press a key.

@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Claude.ai Usage & Context Overlay (DOM Sync v2.2)
 // @namespace    https://github.com/wojtulab/claude-code-usage
-// @version      2.12.2
+// @version      2.12.3
 // @description  Monitor Claude.ai 1M context and 5h/7d usage limits, sound/browser alerts before & after reset or response completion, and auto-click "Try again".
 // @homepageURL  https://github.com/wojtulab/claude-code-usage
 // @supportURL   https://github.com/wojtulab/claude-code-usage/issues
@@ -16,7 +16,7 @@
 (function () {
   'use strict';
 
-  const VERSION = '2.12.2';
+  const VERSION = '2.12.3';
   const TICK_INTERVAL_MS = 1000;             // Countdown, alerts, and button checks every 1s
 
   // Settings: ⚙ panel in overlay header, saved to localStorage (claude_overlay_cfg_v1). CFG_SCHEMA entries: [key, label, type, default].
@@ -33,7 +33,8 @@
     ['doneMinSec', 'Response ready: min generation time (s)', 'num', 10],
     ['fcMin', 'Forecast: alert if limit ends within (min, 0 = off)', 'num', 30],
     ['sessList', 'Session list in overlay (claude.ai/code)', 'bool', true],
-    ['titleInfo', 'Tab title: busy state and session %', 'bool', true],
+    ['titleInfo', 'Tab title: busy state and %', 'bool', true],
+    ['titlePct', 'Tab title %', 'select', 'session', [['session', 'Session (5h)'], ['weekly', 'Weekly (7d)'], ['off', 'Off']]],
     ['titleBlink', 'Response ready: blink ✅ in title + green icon (silent)', 'bool', true],
     ['hiddenOnly', 'Notifications only when tab is in background', 'bool', true],
     ['opacityIdle', 'Opacity (%)', 'num', 50],
@@ -42,6 +43,7 @@
   const cfg = Object.assign({ minimized: false }, Object.fromEntries(CFG_SCHEMA.map((s) => [s[0], s[3]])));
   try { Object.assign(cfg, JSON.parse(localStorage.getItem('claude_overlay_cfg_v1')) || {}); } catch (e) {}
   cfg.minimized = !!cfg.minimized;
+  if (!['session', 'weekly', 'off'].includes(cfg.titlePct)) cfg.titlePct = 'session';
 
   function applyCfg() {
     let st = document.getElementById('claude-usage-overlay-cfgstyle');
@@ -61,16 +63,25 @@
     h.textContent = '⚙ Claude Settings';
     h.style.cssText = 'font-weight:bold;margin-bottom:8px;border-bottom:1px solid #333;padding-bottom:4px;';
     p.appendChild(h);
-    CFG_SCHEMA.forEach(([k, label, type]) => {
+    CFG_SCHEMA.forEach(([k, label, type, def, opts]) => {
       const row = document.createElement('label');
       row.style.cssText = 'display:flex;justify-content:space-between;align-items:center;gap:10px;margin:4px 0;cursor:pointer;';
       const t = document.createElement('span'); t.textContent = label;
-      const i = document.createElement('input');
-      i.type = type === 'bool' ? 'checkbox' : 'number';
-      if (type === 'bool') i.checked = !!cfg[k]; else { i.value = cfg[k]; i.style.width = '56px'; }
+      let i;
+      if (type === 'select') {
+        i = document.createElement('select');
+        i.style.cssText = 'background:#2d2d2d;color:#e0e0e0;border:1px solid #555;border-radius:4px;padding:1px 4px;font-size:11px;';
+        opts.forEach(([val, txt]) => { const o = document.createElement('option'); o.value = val; o.textContent = txt; i.appendChild(o); });
+        i.value = cfg[k];
+      } else {
+        i = document.createElement('input');
+        i.type = type === 'bool' ? 'checkbox' : 'number';
+        if (type === 'bool') i.checked = !!cfg[k]; else { i.value = cfg[k]; i.style.width = '56px'; }
+      }
       i.onchange = () => {
-        const n = parseFloat(i.value); // 0 is a valid value
-        cfg[k] = type === 'bool' ? i.checked : (Number.isFinite(n) && n >= 0 ? n : CFG_SCHEMA.find((s) => s[0] === k)[3]);
+        if (type === 'select') cfg[k] = opts.some(([v]) => v === i.value) ? i.value : def;
+        else if (type === 'bool') cfg[k] = i.checked;
+        else { const n = parseFloat(i.value); cfg[k] = Number.isFinite(n) && n >= 0 ? n : def; } // 0 is a valid value
         if (type === 'bool' && i.checked && /Notify$/.test(k)) askNotifyPermission();
         try { localStorage.setItem('claude_overlay_cfg_v1', JSON.stringify(cfg)); } catch (e) {}
         applyCfg();
@@ -620,7 +631,8 @@
     if (cfg.titleInfo) {
       const busyN = busyCount();
       const busyPart = busyN ? '🔄' + (busyN > 1 ? busyN : '') + ' ' : '';
-      const pct = /^\d+$/.test(String(state.sessionPct)) ? state.sessionPct + '% · ' : '';
+      const rawPct = cfg.titlePct === 'weekly' ? state.weeklyPct : (cfg.titlePct === 'off' ? '' : state.sessionPct);
+      const pct = /^\d+$/.test(String(rawPct)) ? rawPct + '% · ' : '';
       next = alertPart + busyPart + pct + base;
     } else {
       next = alertPart + base;
