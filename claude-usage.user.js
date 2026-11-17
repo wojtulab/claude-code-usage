@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Claude.ai Usage & Context Overlay (DOM Sync v2.2)
 // @namespace    https://github.com/wojtulab/claude-code-usage
-// @version      2.12.1
+// @version      2.12.2
 // @description  Monitor Claude.ai 1M context and 5h/7d usage limits, sound/browser alerts before & after reset or response completion, and auto-click "Try again".
 // @homepageURL  https://github.com/wojtulab/claude-code-usage
 // @supportURL   https://github.com/wojtulab/claude-code-usage/issues
@@ -16,7 +16,7 @@
 (function () {
   'use strict';
 
-  const VERSION = '2.12.1';
+  const VERSION = '2.12.2';
   const TICK_INTERVAL_MS = 1000;             // Countdown, alerts, and button checks every 1s
 
   // Settings: ⚙ panel in overlay header, saved to localStorage (claude_overlay_cfg_v1). CFG_SCHEMA entries: [key, label, type, default].
@@ -964,6 +964,10 @@
           </span>
         </div>
         <div style="font-size:10px;color:#aaa">Last attempt: ${esc(state.lastTry || 'now')}</div>
+        <div style="font-size:9px;color:#666;margin-top:5px;border-top:1px solid #333;padding-top:4px;display:flex;justify-content:space-between;">
+          <span>Auto: ${cfg.refreshSec}s · v${VERSION}</span>
+          <span>Click panel to retry</span>
+        </div>
       `;
     } else {
       const alertBanner = (state.hasContextUI && state.contextPct >= cfg.threshold)
@@ -1192,11 +1196,24 @@
   }
 
   function initOverlay() {
-    if (document.getElementById('claude-usage-overlay')) return;
+    const prev = document.getElementById('claude-usage-overlay');
+    if (prev) {
+      if (prev.dataset.ver !== VERSION && !document.getElementById('claude-usage-dup-warn')) {
+        const w = document.createElement('div');
+        w.id = 'claude-usage-dup-warn';
+        w.style.cssText = 'position:fixed;top:12px;right:16px;z-index:2147483647;background:#3a1f1b;color:#ffd0c7;border:1px solid #ff6b6b;border-radius:6px;padding:6px 10px;font:11px/1.35 sans-serif;max-width:300px;box-shadow:0 4px 12px rgba(0,0,0,.6);cursor:pointer;';
+        w.textContent = `⚠️ Duplicate Claude script in Tampermonkey (${prev.dataset.ver || '≤2.11'} blocks v${VERSION}). Remove the older copy in Tampermonkey Dashboard.`;
+        w.title = 'Click to dismiss';
+        w.onclick = () => w.remove();
+        document.body.appendChild(w);
+      }
+      return;
+    }
     injectStyles();
 
     const overlay = document.createElement('div');
     overlay.id = 'claude-usage-overlay';
+    overlay.dataset.ver = VERSION;
     overlay.style.cssText = `
       position:fixed; bottom:80px; right:16px; z-index:999999;
       background:#1e1e1e; color:#e0e0e0; padding:10px 14px;
