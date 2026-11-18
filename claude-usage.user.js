@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Claude.ai Usage & Context Overlay (DOM Sync v2.2)
 // @namespace    https://github.com/wojtulab/claude-code-usage
-// @version      2.12.18
+// @version      2.12.19
 // @description  Monitor Claude.ai 1M context and 5h/7d usage limits, sound/browser alerts before & after reset or response completion, and auto-click "Try again".
 // @homepageURL  https://github.com/wojtulab/claude-code-usage
 // @supportURL   https://github.com/wojtulab/claude-code-usage/issues
@@ -16,7 +16,7 @@
 (function () {
   'use strict';
 
-  const VERSION = '2.12.18';
+  const VERSION = '2.12.19';
   const TICK_INTERVAL_MS = 1000;             // Countdown, alerts, and button checks every 1s
 
   const lsGet = (k) => { try { return localStorage.getItem(k); } catch (e) { return null; } }; // blocked storage must not stop the script
@@ -42,6 +42,8 @@
     ['titlePct', 'Tab title %', 'select', 'session', [['session', 'Session (5h)'], ['weekly', 'Weekly (7d)'], ['off', 'Off']]],
     ['titleBlink', 'Response ready: blink ✅ in title + green icon (silent)', 'bool', true],
     ['hiddenOnly', 'Notifications only when tab is in background', 'bool', true],
+    ['quietFrom', 'Quiet hours: from (h, same as to = off)', 'num', 0, [0, 23]],
+    ['quietTo', 'Quiet hours: to (h)', 'num', 0, [0, 23]],
     ['opacityIdle', 'Opacity (%)', 'num', 50, [10, 100]],
     ['opacityHover', 'Opacity on hover (%)', 'num', 90, [10, 100]]
   ];
@@ -357,7 +359,7 @@
   const away = () => document.hidden || !document.hasFocus(); // background tab OR unfocused window (second monitor)
   const openNs = new Set(); // open sticky notifications; closeN closes all of them
   function closeN() { openNs.forEach((n) => { try { n.close(); } catch (e) {} }); openNs.clear(); }
-  const snoozed = () => { try { return Date.now() < (+localStorage.getItem('ide_snooze_until') || 0); } catch (e) { return false; } }; // F3: sound and system notifications muted until ts (visual signals stay)
+  const snoozed = () => { try { if (Date.now() < (+localStorage.getItem('ide_snooze_until') || 0)) return true; } catch (e) {} const f = cfg.quietFrom, t = cfg.quietTo, h = new Date().getHours(); return f !== t && (f < t ? h >= f && h < t : h >= f || h < t); }; // F3: sound and system notifications muted until ts (visual signals stay)
   function notify(title, body, tag, force, sticky, onClick) {
     if (snoozed()) return;
     if (cfg.hiddenOnly && !away() && !force) return;
@@ -1174,7 +1176,7 @@
     });
     items.sort((a, b) => a.o - b.o || a.t - b.t);
     const li = items.slice(0, 8).map((i) => `
-      <div data-sess="${esc(i.key)}" title="Open session" style="display:flex;gap:5px;align-items:center;font-size:11px;cursor:pointer;padding:1px 0;">
+      <div data-sess="${esc(i.key)}" id="cu-s-${i.key.replace(/\W/g, '_')}" role="button" tabindex="0" aria-label="Open session: ${esc(i.title)}" title="Open session" style="display:flex;gap:5px;align-items:center;font-size:11px;cursor:pointer;padding:1px 0;">
         <span>${i.icon}</span><span style="flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:150px">${esc(i.title)}</span><small style="color:#888">${fmtDur(i.t)}</small>
       </div>`).join('');
     return `<div style="border-top:1px solid #333;padding-top:5px;margin-top:4px;">
@@ -1551,6 +1553,14 @@
       openSession(it.getAttribute('data-sess'));
       renderOverlay();
     }, true);
+    overlay.addEventListener('keydown', (e) => { // R10: session rows are role=button — Enter/Space open the session
+      if (e.key !== 'Enter' && e.key !== ' ') return;
+      const it = e.target.closest && e.target.closest('[data-sess]');
+      if (!it) return;
+      e.preventDefault();
+      openSession(it.getAttribute('data-sess'));
+      renderOverlay();
+    });
     document.body.appendChild(overlay);
     makeMovable(overlay, 'claude_overlay_pos_v1');
 
