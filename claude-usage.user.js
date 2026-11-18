@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Claude.ai Usage & Context Overlay (DOM Sync v2.2)
 // @namespace    https://github.com/wojtulab/claude-code-usage
-// @version      2.12.7
+// @version      2.12.17
 // @description  Monitor Claude.ai 1M context and 5h/7d usage limits, sound/browser alerts before & after reset or response completion, and auto-click "Try again".
 // @homepageURL  https://github.com/wojtulab/claude-code-usage
 // @supportURL   https://github.com/wojtulab/claude-code-usage/issues
@@ -16,33 +16,46 @@
 (function () {
   'use strict';
 
-  const VERSION = '2.12.7';
+  const VERSION = '2.12.17';
   const TICK_INTERVAL_MS = 1000;             // Countdown, alerts, and button checks every 1s
+
+  const lsGet = (k) => { try { return localStorage.getItem(k); } catch (e) { return null; } }; // blocked storage must not stop the script
 
   // Settings: ⚙ panel in overlay header, saved to localStorage (claude_overlay_cfg_v1). CFG_SCHEMA entries: [key, label, type, default].
   const CFG_SCHEMA = [
-    ['threshold', 'Context warning threshold (%)', 'num', 80],
-    ['refreshSec', 'API refresh interval (s)', 'num', 10],
+    ['threshold', 'Context warning threshold (%)', 'num', 80, [1, 100]],
+    ['refreshSec', 'API refresh interval (s)', 'num', 10, [2, 3600]],
     ['soundContext', 'Sound: context ≥ threshold / quota forecast', 'bool', true],
     ['soundPre', 'Sound: 1 minute before reset', 'bool', true],
     ['soundReset', 'Sound: session recovered', 'bool', true],
     ['qSound', 'Question / approval: sound', 'bool', true],
     ['qNotify', 'Question / approval: browser notification', 'bool', true],
+    ['qRepeatSec', 'Question / approval: repeat every (s, 0 = once)', 'num', 60, [0, 3600]],
     ['doneSound', 'Response ready: sound', 'bool', true],
     ['doneNotify', 'Response ready: browser notification', 'bool', true],
-    ['doneMinSec', 'Response ready: min generation time (s)', 'num', 10],
-    ['fcMin', 'Forecast: alert if limit ends within (min, 0 = off)', 'num', 30],
+    ['doneMinSec', 'Response ready: min generation time (s)', 'num', 10, [0, 3600]],
+    ['doneRepeatSec', 'Response ready: repeat every (s, 0 = off)', 'num', 0, [0, 3600]],
+    ['fcMin', 'Forecast: alert if limit ends within (min, 0 = off)', 'num', 30, [0, 1440]],
     ['sessList', 'Session list in overlay (claude.ai/code)', 'bool', true],
     ['autoAllow', 'Auto-click "Allow once" (permission)', 'bool', false],
     ['titleInfo', 'Tab title: busy state and %', 'bool', true],
     ['titlePct', 'Tab title %', 'select', 'session', [['session', 'Session (5h)'], ['weekly', 'Weekly (7d)'], ['off', 'Off']]],
     ['titleBlink', 'Response ready: blink ✅ in title + green icon (silent)', 'bool', true],
     ['hiddenOnly', 'Notifications only when tab is in background', 'bool', true],
-    ['opacityIdle', 'Opacity (%)', 'num', 50],
-    ['opacityHover', 'Opacity on hover (%)', 'num', 90]
+    ['opacityIdle', 'Opacity (%)', 'num', 50, [10, 100]],
+    ['opacityHover', 'Opacity on hover (%)', 'num', 90, [10, 100]]
   ];
   const cfg = Object.assign({ minimized: false }, Object.fromEntries(CFG_SCHEMA.map((s) => [s[0], s[3]])));
   try { Object.assign(cfg, JSON.parse(localStorage.getItem('claude_overlay_cfg_v1')) || {}); } catch (e) {}
+  // Types and ranges from the schema (num: 5th element [min, max]); applied at start, on change and on sync from another tab.
+  function normCfg() {
+    CFG_SCHEMA.forEach(([k, , type, def, opt]) => {
+      if (type === 'num') { const n = typeof cfg[k] === 'number' ? cfg[k] : NaN; const [lo, hi] = opt || [0, 1e6]; cfg[k] = Number.isFinite(n) ? Math.min(hi, Math.max(lo, n)) : def; }
+      else if (type === 'bool') { if (typeof cfg[k] !== 'boolean') cfg[k] = def; }
+      else if (type === 'select' && !opt.some(([v]) => v === cfg[k])) cfg[k] = def;
+    });
+  }
+  normCfg();
   cfg.minimized = !!cfg.minimized;
   cfg.autoAllow = !!cfg.autoAllow;
   if (!['session', 'weekly', 'off'].includes(cfg.titlePct)) cfg.titlePct = 'session';
@@ -53,6 +66,93 @@
     st.textContent = `#claude-usage-overlay{opacity:${cfg.opacityIdle / 100} !important}#claude-usage-overlay:hover{opacity:${cfg.opacityHover / 100} !important}`;
   }
 
+  // F1: "Connection & data" block in settings: data age, API/backoff state, redacted diagnostics to clipboard.
+  function diagReport() {
+    let shared = 0; try { shared = +localStorage.getItem(BLOCK_KEY) || 0; } catch (e) {}
+    const until = Math.max(apiBlockedUntil, shared);
+    return {
+      version: VERSION, at: new Date().toISOString(),
+      data: { sessionPct: state.sessionPct, weeklyPct: state.weeklyPct, stale: isStale(), error: !!state.error, ageSec: lastSuccessTs ? Math.round((Date.now() - lastSuccessTs) / 1000) : null },
+      api: { refreshSec: cfg.refreshSec, backoffUntil: until > Date.now() ? new Date(until).toISOString() : null, org: cachedOrgId ? cachedOrgId.slice(0, 6) + '…' : null },
+      questions: qMap.size, sessionsOnPage: document.querySelectorAll('[data-row-key]').length
+    };
+  }
+  function buildDataBox() {
+    const box = document.createElement('div');
+    box.style.cssText = 'margin-top:8px;border-top:1px solid #333;padding-top:6px;font-size:10px;color:#aaa;';
+    const h = document.createElement('div'); h.textContent = 'Connection & data'; h.style.cssText = 'font-weight:bold;color:#ccc;margin-bottom:3px;';
+    box.appendChild(h);
+    const r = diagReport();
+    const age = r.data.ageSec == null ? 'no successful read yet' : (r.data.ageSec < 90 ? r.data.ageSec + ' s ago' : Math.round(r.data.ageSec / 60) + ' min ago');
+    const lines = [
+      'Usage: session ' + r.data.sessionPct + '%, weekly ' + r.data.weeklyPct + '% · ' + age + (r.data.stale ? ' (stale)' : ''),
+      'API: ' + (r.data.error ? 'error' : 'ok') + (r.api.backoffUntil ? ' · backoff until ' + r.api.backoffUntil.slice(11, 19) + ' UTC' : '') + ' · every ' + r.api.refreshSec + ' s',
+      'Org: ' + (r.api.org || 'unknown') + ' · questions waiting: ' + r.questions
+    ];
+    lines.forEach((t) => { const d = document.createElement('div'); d.textContent = t; box.appendChild(d); });
+    const b = document.createElement('button'); b.type = 'button'; b.textContent = 'Copy diagnostics';
+    b.style.cssText = 'margin-top:4px;background:#2d2d2d;color:#bbb;border:1px solid #444;border-radius:4px;padding:1px 6px;font-size:10px;cursor:pointer;';
+    b.onclick = () => {
+      let ok = false;
+      try { navigator.clipboard.writeText(JSON.stringify(diagReport(), null, 2)).then(() => { b.textContent = 'Copied'; }, () => { b.textContent = 'Copy failed'; }); ok = true; } catch (e) {}
+      if (!ok) b.textContent = 'Copy failed';
+    };
+    box.appendChild(b);
+    return box;
+  }
+
+  const IDE_KIND = 'claude', CFG_KEY = 'claude_overlay_cfg_v1', OVERLAY_ID = 'claude-usage-overlay';
+  // F4: settings export/import (preferences only: no account data, no replay requests) and resets from the UI.
+  function buildToolsBox() {
+    const box = document.createElement('div');
+    box.style.cssText = 'margin-top:8px;border-top:1px solid #333;padding-top:6px;font-size:10px;color:#aaa;';
+    const h = document.createElement('div'); h.textContent = 'Settings backup & reset'; h.style.cssText = 'font-weight:bold;color:#ccc;margin-bottom:3px;';
+    const note = document.createElement('div'); note.style.cssText = 'min-height:12px;color:#8ab4f8;margin-top:2px;';
+    const mk = (label, fn) => {
+      const b = document.createElement('button'); b.type = 'button'; b.textContent = label;
+      b.style.cssText = 'margin:2px 4px 2px 0;background:#2d2d2d;color:#bbb;border:1px solid #444;border-radius:4px;padding:1px 6px;font-size:10px;cursor:pointer;';
+      b.onclick = fn; return b;
+    };
+    const ta = document.createElement('textarea'); ta.placeholder = 'Paste exported settings JSON here'; ta.rows = 2;
+    ta.style.cssText = 'display:block;width:100%;box-sizing:border-box;margin-top:3px;background:#2d2d2d;color:#e0e0e0;border:1px solid #555;border-radius:4px;font-size:10px;';
+    const save = () => { normCfg(); try { localStorage.setItem(CFG_KEY, JSON.stringify(cfg)); } catch (e) {} applyCfg(); renderOverlay(); };
+    const exportJson = () => JSON.stringify({ ide: IDE_KIND, v: 1, cfg: Object.fromEntries([...CFG_SCHEMA.map((x) => x[0]), 'minimized'].map((k) => [k, cfg[k]])) }, null, 2);
+    box.append(h,
+      mk('Copy settings', () => { try { navigator.clipboard.writeText(exportJson()).then(() => { note.textContent = 'Settings copied'; }, () => { note.textContent = 'Copy failed'; }); } catch (e) { note.textContent = 'Copy failed'; } }),
+      mk('Reset settings', () => { CFG_SCHEMA.forEach((x) => { cfg[x[0]] = x[3]; }); cfg.minimized = false; save(); note.textContent = 'Settings reset (history and position kept)'; }),
+      mk('Reset position', () => { const o = document.getElementById(OVERLAY_ID); if (o && o._resetPos) o._resetPos(); note.textContent = 'Position reset'; }),
+      ta,
+      mk('Import settings', () => {
+        let d; try { d = JSON.parse(ta.value); } catch (e) { note.textContent = 'Invalid JSON'; return; }
+        if (!d || d.ide !== IDE_KIND || d.v !== 1 || !d.cfg || typeof d.cfg !== 'object') { note.textContent = 'Not a ' + IDE_KIND + ' settings export'; return; }
+        const keys = [...CFG_SCHEMA.map((x) => x[0]), 'minimized'].filter((k) => k in d.cfg);
+        keys.forEach((k) => { cfg[k] = d.cfg[k]; });
+        save(); note.textContent = 'Imported ' + keys.length + ' settings (invalid values reset to allowed ranges)';
+      }), note);
+    return box;
+  }
+
+  // F3: snooze sound + system notifications (visual signals stay); shared between tabs through localStorage.
+  function buildSnoozeBox() {
+    const box = document.createElement('div');
+    box.style.cssText = 'margin-top:8px;border-top:1px solid #333;padding-top:6px;font-size:10px;color:#aaa;';
+    const h = document.createElement('div'); h.textContent = 'Snooze alerts (sound + notifications)'; h.style.cssText = 'font-weight:bold;color:#ccc;margin-bottom:3px;';
+    const note = document.createElement('span'); note.style.cssText = 'margin-left:4px;color:#8ab4f8;';
+    const show = () => {
+      let u = 0; try { u = +localStorage.getItem('ide_snooze_until') || 0; } catch (e) {}
+      note.textContent = u > Date.now() ? '🔕 until ' + new Date(u).toTimeString().slice(0, 5) : 'alerts on';
+    };
+    const mk = (label, min) => {
+      const b = document.createElement('button'); b.type = 'button'; b.textContent = label;
+      b.style.cssText = 'margin:2px 4px 2px 0;background:#2d2d2d;color:#bbb;border:1px solid #444;border-radius:4px;padding:1px 6px;font-size:10px;cursor:pointer;';
+      b.onclick = () => { try { if (min) localStorage.setItem('ide_snooze_until', String(Date.now() + min * 60000)); else localStorage.removeItem('ide_snooze_until'); } catch (e) {} show(); };
+      return b;
+    };
+    box.append(h, mk('15 min', 15), mk('60 min', 60), mk('Off', 0), note);
+    show();
+    return box;
+  }
+
   function openSettings() {
     const old = document.getElementById('claude-usage-overlay-cfg');
     if (old) { if (old._close) old._close(); else old.remove(); return; }
@@ -60,7 +160,7 @@
     const r = ov ? ov.getBoundingClientRect() : { left: innerWidth - 16, right: innerWidth - 16, top: innerHeight - 160, bottom: innerHeight - 80 };
     const p = document.createElement('div');
     p.id = 'claude-usage-overlay-cfg';
-    p.style.cssText = 'position:fixed;z-index:2147483647;background:#1e1e1e;color:#e0e0e0;border:1px solid #777;border-radius:8px;padding:10px 12px;font:12px sans-serif;box-shadow:0 4px 16px rgba(0,0,0,.6);min-width:240px;max-width:calc(100vw - 16px);max-height:calc(100vh - 16px);overflow-y:auto;';
+    p.style.cssText = 'position:fixed;z-index:2147483647;background:#1e1e1e;color:#e0e0e0;border:1px solid #777;border-radius:8px;padding:10px 12px;font:12px sans-serif;box-shadow:0 4px 16px rgba(0,0,0,.6);min-width:240px;max-width:calc(100vw - 16px);max-height:calc(100vh - 16px);box-sizing:border-box;overflow-y:auto;';
     const h = document.createElement('div');
     h.textContent = '⚙ Claude Settings';
     h.style.cssText = 'font-weight:bold;margin-bottom:8px;border-bottom:1px solid #333;padding-bottom:4px;';
@@ -83,7 +183,8 @@
       i.onchange = () => {
         if (type === 'select') cfg[k] = opts.some(([v]) => v === i.value) ? i.value : def;
         else if (type === 'bool') cfg[k] = i.checked;
-        else { const n = parseFloat(i.value); cfg[k] = Number.isFinite(n) && n >= 0 ? n : def; } // 0 is a valid value
+        else { const n = parseFloat(i.value); cfg[k] = Number.isFinite(n) ? n : def; } // 0 is a valid value; range from schema (normCfg)
+        normCfg(); if (type === 'num') i.value = cfg[k];
         if (type === 'bool' && i.checked && /Notify$/.test(k)) askNotifyPermission();
         try { localStorage.setItem('claude_overlay_cfg_v1', JSON.stringify(cfg)); } catch (e) {}
         applyCfg();
@@ -93,6 +194,9 @@
       row.append(t, i);
       p.appendChild(row);
     });
+    p.appendChild(buildDataBox());
+    p.appendChild(buildSnoozeBox());
+    p.appendChild(buildToolsBox());
     const x = document.createElement('div');
     x.textContent = 'Refresh/threshold changes apply immediately; settings are stored per browser.';
     x.style.cssText = 'font-size:9px;color:#777;margin-top:6px;';
@@ -117,24 +221,27 @@
       p.style.bottom = Math.max(8, botPx) + 'px';
     }
 
-    const close = () => {
+    const close = (back) => {
       p.remove();
       document.removeEventListener('keydown', onKey, true);
       document.removeEventListener('pointerdown', onOutside, true);
+      if (back) { const g = document.getElementById('claude-cfg-btn'); if (g) g.focus(); } // keyboard user returns to the gear
     };
     p._close = close;
-    const onKey = (e) => { if (e.key === 'Escape') { e.stopPropagation(); close(); } };
+    p.setAttribute('role', 'dialog'); p.setAttribute('aria-label', 'Claude settings');
+    const onKey = (e) => { if (e.key === 'Escape') { e.stopPropagation(); close(true); } };
     const onOutside = (e) => { if (!p.contains(e.target) && !(ov && ov.contains(e.target))) close(); };
     document.addEventListener('keydown', onKey, true);
     document.addEventListener('pointerdown', onOutside, true);
+    const first = p.querySelector('input, select'); if (first) first.focus();
   }
 
-  let cachedOrgId = localStorage.getItem('claude_overlay_org_id') || null;
+  let cachedOrgId = lsGet('claude_overlay_org_id') || null;
   let alertedContext = false;
 
   // Remember reset timestamps for which sounds were already played (prevents duplicates after F5)
-  let lastPreResetSoundTs = Number(localStorage.getItem('claude_overlay_pre_sound_ts')) || 0;
-  let lastResetSoundTs = Number(localStorage.getItem('claude_overlay_reset_sound_ts')) || 0;
+  let lastPreResetSoundTs = Number(lsGet('claude_overlay_pre_sound_ts')) || 0;
+  let lastResetSoundTs = Number(lsGet('claude_overlay_reset_sound_ts')) || 0;
 
   // "Try again" click tracking
   let lastTryAgainClickTime = 0;
@@ -156,7 +263,7 @@
     hasContextUI: false,
     lastUpdated: null,
     error: false,
-    autoTryAgain: localStorage.getItem('claude_overlay_auto_try_again') !== 'false', // enabled by default
+    autoTryAgain: lsGet('claude_overlay_auto_try_again') !== 'false', // enabled by default
     statusNote: ''
   };
 
@@ -209,6 +316,8 @@
         0%, 100% { border-color: #444; box-shadow: 0 4px 12px rgba(0,0,0,0.5); }
         50% { border-color: #ff9800; box-shadow: 0 0 14px 3px #ff9800; }
       }
+      #claude-usage-overlay button:focus-visible, #claude-usage-overlay input:focus-visible { outline: 2px solid #8ab4f8; outline-offset: 1px; }
+      @media (prefers-reduced-motion: reduce) { .claude-overlay-critical, .claude-overlay-question { animation: none !important; } }
       .claude-overlay-critical {
         animation: claudePulseRed 2s infinite !important;
         background: #2a1215 !important;
@@ -248,7 +357,9 @@
   const away = () => document.hidden || !document.hasFocus(); // background tab OR unfocused window (second monitor)
   const openNs = new Set(); // open sticky notifications; closeN closes all of them
   function closeN() { openNs.forEach((n) => { try { n.close(); } catch (e) {} }); openNs.clear(); }
+  const snoozed = () => { try { return Date.now() < (+localStorage.getItem('ide_snooze_until') || 0); } catch (e) { return false; } }; // F3: sound and system notifications muted until ts (visual signals stay)
   function notify(title, body, tag, force, sticky, onClick) {
+    if (snoozed()) return;
     if (cfg.hiddenOnly && !away() && !force) return;
     try {
       if ('Notification' in window && Notification.permission === 'granted') {
@@ -279,8 +390,10 @@
   // Multi-tab coordination: only the tab that wins the claim sends the alert for an event. Write TAB_ID+time to localStorage,
   // read back after ~50 ms (last write visible to all tabs wins); key fresher than ttlMs held by another tab → false.
   // Shared block with antigravity-quota.user.js: change in one = change in both.
+  // Key = readable prefix + hash of the rest: no chat titles in localStorage key names. Claims older than 1 h are removed at start.
   function claimOnce(key, ttlMs) {
-    const k = 'ide_claim_' + key;
+    let hh = 5381; for (let i = 0; i < key.length; i++) hh = ((hh << 5) + hh + key.charCodeAt(i)) | 0;
+    const k = 'ide_claim_' + key.split('-')[0] + '_' + (hh >>> 0).toString(36);
     try {
       const cur = JSON.parse(localStorage.getItem(k) || 'null');
       if (cur && cur.id !== TAB_ID && Date.now() - cur.t < ttlMs) return Promise.resolve(false);
@@ -290,6 +403,12 @@
       try { const c = JSON.parse(localStorage.getItem(k) || 'null'); res(!c || c.id === TAB_ID); } catch (e) { res(true); }
     }, 50));
   }
+  try {
+    for (let i = localStorage.length - 1; i >= 0; i--) {
+      const ck = localStorage.key(i);
+      if (ck && ck.startsWith('ide_claim_')) { const c = JSON.parse(localStorage.getItem(ck) || 'null'); if (!c || !(Date.now() - c.t < 3600e3)) localStorage.removeItem(ck); }
+    }
+  } catch (e) {}
   function diag(k, extra) {
     try {
       const a = JSON.parse(localStorage.getItem(DIAG_KEY) || '[]');
@@ -301,6 +420,7 @@
 
   // Generic Web Audio API tone sequence player
   function playTones(notes) {
+    if (snoozed()) return;
     const ctx = ensureAudio();
     if (!ctx) return;
     const t0 = Date.now();
@@ -495,7 +615,7 @@
       if (pctVal >= cfg.threshold && !alertedContext) {
         alertedContext = true;
         if (cfg.soundContext) {
-          claimOnce('ctx-alert', 60000).then((ok) => {
+          claimOnce('ctx-alert-' + location.pathname, 60000).then((ok) => {
             if (ok && cfg.soundContext) playContextAlertBeep();
           });
         }
@@ -658,18 +778,24 @@
     for (const k of [...qMap.keys()]) {
       if (!active.has(k)) qMap.delete(k);
     }
+    const fireQ = (key, info) => claimOnce('claude-q-' + key, 5000).then((ok) => {
+      if (!ok) { diag('claim-lost', { k: 'q' }); return; }
+      diag('q-alert', { k: key.slice(-12) });
+      if (cfg.qSound) playQuestionBeep();
+      if (cfg.qNotify) {
+        notify('Claude needs approval', info.title, 'claude-q-' + key, !info.current, true,
+          key !== 'chat' ? () => { openSession(key); applyTitle(); } : null);
+      }
+    });
     active.forEach((info, key) => {
-      if (qMap.has(key)) return;
+      const ex = qMap.get(key), now = Date.now();
+      if (ex) { // question still waiting: repeat every qRepeatSec (like AG)
+        if (cfg.qRepeatSec && now - ex.alertAt >= cfg.qRepeatSec * 1000) { ex.alertAt = now; fireQ(key, info); }
+        return;
+      }
+      info.alertAt = now;
       qMap.set(key, info);
-      claimOnce('claude-q-' + key, 5000).then((ok) => {
-        if (!ok) { diag('claim-lost', { k: 'q' }); return; }
-        diag('q-alert', { k: key.slice(-12) });
-        if (cfg.qSound) playQuestionBeep();
-        if (cfg.qNotify) {
-          notify('Claude needs approval', info.title, 'claude-q-' + key, !info.current, true,
-            key !== 'chat' ? () => { openSession(key); applyTitle(); } : null);
-        }
-      });
+      fireQ(key, info);
     });
     qActive = active.size > 0;
   }
@@ -780,6 +906,7 @@
         const c = JSON.parse(e.newValue);
         if (c && typeof c === 'object') {
           Object.assign(cfg, c);
+          normCfg();
           cfg.minimized = !!cfg.minimized;
           cfg.autoAllow = !!cfg.autoAllow;
           if (!['session', 'weekly', 'off'].includes(cfg.titlePct)) cfg.titlePct = 'session';
@@ -826,17 +953,28 @@
 
   // Shared "done" alert; Stop button and sidebar session spinner detectors won't duplicate it within 5s.
   let lastDone = { tag: '', at: 0 };
+  let doneAlert = null; // last fired "done" alert, repeated every doneRepeatSec while still unvisited (like AG dRepeatSec)
+  function fireDone(title, tag, force, sessKey) {
+    claimOnce('done-' + tag + '-' + title, cfg.doneRepeatSec ? Math.min(10000, Math.max(500, cfg.doneRepeatSec * 500)) : 10000).then((ok) => {
+      if (!ok) { diag('claim-lost', { k: 'done' }); return; }
+      if (cfg.doneSound) playDoneBeep();
+      if (cfg.doneNotify) notify('Claude responded', title, tag, force, true, sessKey ? () => { openSession(sessKey); applyTitle(); } : null);
+    });
+  }
+  function repeatDone() {
+    if (!(titleDone || rowDone.size) || !away()) { doneAlert = null; return; }
+    if (!doneAlert || !cfg.doneRepeatSec || Date.now() - doneAlert.at < cfg.doneRepeatSec * 1000) return;
+    doneAlert.at = Date.now();
+    fireDone(doneAlert.title, doneAlert.tag, doneAlert.force, doneAlert.sessKey);
+  }
   function alertDone(title, tag, force, sessKey) {
     const now = Date.now();
     // same completion seen by both detectors (tag "claude-done" = Stop); distinct sessions don't block each other
     if (now - lastDone.at < 5000 && (lastDone.tag === tag || lastDone.tag === 'claude-done' || tag === 'claude-done')) return;
     lastDone = { tag, at: now };
     diag('alert', { tag: String(tag).slice(-14), f: force ? 1 : 0 });
-    claimOnce('done-' + tag + '-' + title, 10000).then((ok) => {
-      if (!ok) { diag('claim-lost', { k: 'done' }); return; }
-      if (cfg.doneSound) playDoneBeep();
-      if (cfg.doneNotify) notify('Claude responded', title, tag, force, true, sessKey ? () => { openSession(sessKey); applyTitle(); } : null);
-    });
+    doneAlert = { title, tag, force, sessKey, at: now };
+    fireDone(title, tag, force, sessKey);
   }
 
   // Response ready (open chat): "Stop response" button (or data-is-streaming) disappears for >=2s.
@@ -945,6 +1083,7 @@
     detectQuestions();
     detectResponseDone();
     detectRowsDone();
+    repeatDone();
     if (statusNoteUntil && now > statusNoteUntil) setNote('');
     const limitUI = findLimitCardAndTryAgainBtn();
 
@@ -999,7 +1138,7 @@
     renderOverlay();
   }
 
-  // Session list: working (🔄) and finished unvisited (✅) with duration; clicking opens the session. Rest = idle counter.
+  // Session list: needing attention (❓, first), working (🔄) and finished unvisited (✅) with duration; clicking opens the session. Rest = idle counter.
   function sessionsHtml() {
     if (!cfg.sessList) return '';
     const rows = [...document.querySelectorAll('[data-row-key]')].filter((r) => /^code:/.test(r.getAttribute('data-row-key')));
@@ -1009,7 +1148,8 @@
     rows.forEach((r) => {
       const key = r.getAttribute('data-row-key');
       const busy = !!r.querySelector(BUSY_SEL), done = rowDone.get(key);
-      if (busy) items.push({ key, icon: '🔄', title: rowLabel(r), t: now - ((rowBusy.get(key) || {}).since || now), o: 0 });
+      if (qMap.has(key)) items.push({ key, icon: '❓', title: rowLabel(r) || qMap.get(key).title, t: now - (qMap.get(key).alertAt || now), o: -1 }); // needs attention: first
+      else if (busy) items.push({ key, icon: '🔄', title: rowLabel(r), t: now - ((rowBusy.get(key) || {}).since || now), o: 0 });
       else if (done) items.push({ key, icon: '✅', title: rowLabel(r) || done.title, t: now - done.at, o: 1 });
       else idle++;
     });
@@ -1019,7 +1159,7 @@
         <span>${i.icon}</span><span style="flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:150px">${esc(i.title)}</span><small style="color:#888">${fmtDur(i.t)}</small>
       </div>`).join('');
     return `<div style="border-top:1px solid #333;padding-top:5px;margin-top:4px;">
-      <div style="font-size:10px;color:#888;margin-bottom:2px">Sessions: ${items.filter((i) => i.o === 0).length} working, ${items.filter((i) => i.o === 1).length} ready</div>
+      <div style="font-size:10px;color:#888;margin-bottom:2px">Sessions: ${items.some((i) => i.o === -1) ? items.filter((i) => i.o === -1).length + ' need attention, ' : ''}${items.filter((i) => i.o === 0).length} working, ${items.filter((i) => i.o === 1).length} ready</div>
       ${li}${items.length > 8 ? `<div style="font-size:10px;color:#888">+${items.length - 8} more</div>` : ''}
       <div style="font-size:10px;color:#666">⚪ ${idle} idle</div></div>`;
   }
@@ -1068,8 +1208,8 @@
       html = `<div style="display:flex;align-items:center;gap:8px;white-space:nowrap;font-size:11px;">
         ${pill}
         <span style="display:inline-flex;align-items:center;gap:6px;margin-left:auto;">
-          <span id="claude-min-btn" title="Expand" style="cursor:pointer;font-size:13px;font-weight:bold;padding:0 3px;color:#ccc;">+</span>
-          <span id="claude-cfg-btn" title="Settings" style="cursor:pointer;font-size:13px;font-weight:normal;">⚙</span>
+          <button type="button" id="claude-min-btn" title="Expand" aria-label="Expand" style="background:none;border:0;color:inherit;font-family:inherit;line-height:1;cursor:pointer;font-size:13px;font-weight:bold;padding:0 3px;color:#ccc;">+</button>
+          <button type="button" id="claude-cfg-btn" title="Settings" aria-label="Settings" style="background:none;border:0;color:inherit;font-family:inherit;line-height:1;cursor:pointer;font-size:13px;font-weight:normal;">⚙</button>
         </span>
       </div>`;
     } else if (state.error) {
@@ -1077,8 +1217,8 @@
         <div style="font-weight:bold;margin-bottom:4px;display:flex;justify-content:space-between;align-items:center;">
           <span style="color:#ff6b6b">⚠️ Claude API Error</span>
           <span style="display:inline-flex;align-items:center;gap:6px;">
-            <span id="claude-min-btn" title="Minimize" style="cursor:pointer;font-size:13px;font-weight:bold;padding:0 2px;">–</span>
-            <span id="claude-cfg-btn" title="Settings" style="cursor:pointer;font-size:13px;font-weight:normal;">⚙</span>
+            <button type="button" id="claude-min-btn" title="Minimize" aria-label="Minimize" style="background:none;border:0;color:inherit;font-family:inherit;line-height:1;cursor:pointer;font-size:13px;font-weight:bold;padding:0 2px;">–</button>
+            <button type="button" id="claude-cfg-btn" title="Settings" aria-label="Settings" style="background:none;border:0;color:inherit;font-family:inherit;line-height:1;cursor:pointer;font-size:13px;font-weight:normal;">⚙</button>
           </span>
         </div>
         <div style="font-size:10px;color:#aaa">Last attempt: ${esc(state.lastTry || 'now')}</div>
@@ -1133,8 +1273,8 @@
         <div style="font-weight:bold;margin-bottom:6px;display:flex;justify-content:space-between;align-items:center;border-bottom:1px solid #333;padding-bottom:4px;">
           <span>📊 Claude Monitor</span>
           <span style="display:inline-flex;align-items:center;gap:6px;">
-            <span id="claude-min-btn" title="Minimize" style="cursor:pointer;font-size:13px;font-weight:bold;padding:0 2px;">–</span>
-            <span id="claude-cfg-btn" title="Settings" style="cursor:pointer;font-size:13px;font-weight:normal;">⚙</span>
+            <button type="button" id="claude-min-btn" title="Minimize" aria-label="Minimize" style="background:none;border:0;color:inherit;font-family:inherit;line-height:1;cursor:pointer;font-size:13px;font-weight:bold;padding:0 2px;">–</button>
+            <button type="button" id="claude-cfg-btn" title="Settings" aria-label="Settings" style="background:none;border:0;color:inherit;font-family:inherit;line-height:1;cursor:pointer;font-size:13px;font-weight:normal;">⚙</button>
           </span>
         </div>
 
@@ -1182,7 +1322,9 @@
 
     if (html === lastRenderHtml) return;
     lastRenderHtml = html;
+    const focusId = el.contains(document.activeElement) ? document.activeElement.id : ''; // rebuild must not drop keyboard focus
     el.innerHTML = html;
+    if (focusId) { const fe = document.getElementById(focusId); if (fe) fe.focus(); }
 
     // Bind events for minimize, settings, checkbox, and sound test buttons
     const minBtn = document.getElementById('claude-min-btn');
@@ -1235,6 +1377,8 @@
     st.textContent = `#${el.id}{touch-action:none}`;
     document.head.appendChild(st);
 
+    const defPos = { left: el.style.left, top: el.style.top, right: el.style.right, bottom: el.style.bottom };
+    el._resetPos = () => { try { localStorage.removeItem(key); } catch (e) {} Object.assign(el.style, defPos); };
     function place(x, y) {
       x = Math.max(0, Math.min(x, window.innerWidth - el.offsetWidth));
       y = Math.max(0, Math.min(y, window.innerHeight - el.offsetHeight));
