@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Claude.ai Usage & Context Overlay (DOM Sync v2.2)
 // @namespace    https://github.com/wojtulab/claude-code-usage
-// @version      2.12.22
+// @version      2.12.23
 // @description  Monitor Claude.ai 1M context and 5h/7d usage limits, sound/browser alerts before & after reset or response completion, and auto-click "Try again".
 // @homepageURL  https://github.com/wojtulab/claude-code-usage
 // @supportURL   https://github.com/wojtulab/claude-code-usage/issues
@@ -37,7 +37,7 @@
   })();
   // end R11 storage shim
 
-  const VERSION = '2.12.22';
+  const VERSION = '2.12.23';
   const TICK_INTERVAL_MS = 1000;             // Countdown, alerts, and button checks every 1s
 
   const lsGet = (k) => { try { return localStorage.getItem(k); } catch (e) { return null; } }; // blocked storage must not stop the script
@@ -291,7 +291,7 @@
   }
 
   let cachedOrgId = lsGet('claude_overlay_org_id') || null;
-  let alertedContext = false;
+  const ctxSeen = new Map(); // chat path → { alerted, known }: context alert is per chat, never on first sight (session switch)
 
   // Remember reset timestamps for which sounds were already played (prevents duplicates after F5)
   let lastPreResetSoundTs = Number(lsGet('claude_overlay_pre_sound_ts')) || 0;
@@ -681,16 +681,21 @@
     }
 
     if (pctVal !== null) {
-      if (pctVal >= cfg.threshold && !alertedContext) {
-        alertedContext = true;
-        if (cfg.soundContext) {
-          claimOnce('ctx-alert-' + location.pathname, 60000).then((ok) => {
-            if (ok && cfg.soundContext) playContextAlertBeep();
-          });
+      // Per chat, crossing-based: a chat first seen already above the threshold (user switched sessions) stays silent; hysteresis of 3 points.
+      const path = location.pathname, rec = ctxSeen.get(path) || { alerted: false, known: false };
+      if (pctVal >= cfg.threshold) {
+        if (!rec.alerted) {
+          rec.alerted = true;
+          if (rec.known && cfg.soundContext) {
+            claimOnce('ctx-alert-' + path, 60000).then((ok) => {
+              if (ok && cfg.soundContext) { diag('ctx-alert', { p: pctVal }); playContextAlertBeep(); }
+            });
+          }
         }
-      } else if (pctVal < cfg.threshold) {
-        alertedContext = false;
-      }
+      } else if (pctVal < cfg.threshold - 3) rec.alerted = false;
+      rec.known = true;
+      if (ctxSeen.size > 50) ctxSeen.clear();
+      ctxSeen.set(path, rec);
 
       return {
         hasContextUI: true,
