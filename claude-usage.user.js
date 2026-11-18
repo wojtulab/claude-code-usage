@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Claude.ai Usage & Context Overlay (DOM Sync v2.2)
 // @namespace    https://github.com/wojtulab/claude-code-usage
-// @version      2.12.21
+// @version      2.12.22
 // @description  Monitor Claude.ai 1M context and 5h/7d usage limits, sound/browser alerts before & after reset or response completion, and auto-click "Try again".
 // @homepageURL  https://github.com/wojtulab/claude-code-usage
 // @supportURL   https://github.com/wojtulab/claude-code-usage/issues
@@ -37,7 +37,7 @@
   })();
   // end R11 storage shim
 
-  const VERSION = '2.12.21';
+  const VERSION = '2.12.22';
   const TICK_INTERVAL_MS = 1000;             // Countdown, alerts, and button checks every 1s
 
   const lsGet = (k) => { try { return localStorage.getItem(k); } catch (e) { return null; } }; // blocked storage must not stop the script
@@ -157,6 +157,34 @@
     return box;
   }
 
+  // F3: alert presets — one click sets the per-category sound/notification toggles (no extra stored state, so rollback-safe).
+  // Visual signals (frame, title, favicon) are never touched; only sound and system notifications.
+  const PRESET_GROUPS = { q: ['qSound', 'qNotify'], d: ['doneSound', 'doneNotify'], l: ['soundContext', 'soundPre', 'soundReset'] };
+  function buildPresetBox() {
+    const box = document.createElement('div');
+    box.style.cssText = 'margin-top:8px;border-top:1px solid #333;padding-top:6px;font-size:10px;color:#aaa;';
+    const h = document.createElement('div'); h.textContent = 'Alert presets (sound + notifications)'; h.style.cssText = 'font-weight:bold;color:#ccc;margin-bottom:3px;';
+    const note = document.createElement('span'); note.style.cssText = 'margin-left:4px;color:#8ab4f8;';
+    const apply = (label, on) => {
+      Object.keys(PRESET_GROUPS).forEach((g) => PRESET_GROUPS[g].forEach((k) => { cfg[k] = on.includes(g); }));
+      normCfg();
+      try { localStorage.setItem('claude_overlay_cfg_v1', JSON.stringify(cfg)); } catch (e) {}
+      const rows = box.parentElement ? box.parentElement.querySelectorAll(':scope > label') : [];
+      CFG_SCHEMA.forEach(([k, , type], idx) => { const inp = rows[idx] && rows[idx].querySelector('input'); if (inp && type === 'bool') inp.checked = !!cfg[k]; });
+      if (on.length) askNotifyPermission();
+      applyCfg(); renderOverlay();
+      note.textContent = label + ' applied';
+    };
+    const mk = (label, on) => {
+      const b = document.createElement('button'); b.type = 'button'; b.textContent = label;
+      b.style.cssText = 'margin:2px 4px 2px 0;background:#2d2d2d;color:#bbb;border:1px solid #444;border-radius:4px;padding:1px 6px;font-size:10px;cursor:pointer;';
+      b.onclick = () => apply(label, on);
+      return b;
+    };
+    box.append(h, mk('All alerts', ['q', 'd', 'l']), mk('Questions only', ['q']), mk('Silent (visual only)', []), note);
+    return box;
+  }
+
   // F3: snooze sound + system notifications (visual signals stay); shared between tabs through localStorage.
   function buildSnoozeBox() {
     const box = document.createElement('div');
@@ -220,6 +248,7 @@
       p.appendChild(row);
     });
     p.appendChild(buildDataBox());
+    p.appendChild(buildPresetBox());
     p.appendChild(buildSnoozeBox());
     p.appendChild(buildToolsBox());
     const x = document.createElement('div');
