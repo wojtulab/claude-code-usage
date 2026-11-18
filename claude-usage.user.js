@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Claude.ai Usage & Context Overlay (DOM Sync v2.2)
 // @namespace    https://github.com/wojtulab/claude-code-usage
-// @version      2.12.19
+// @version      2.12.21
 // @description  Monitor Claude.ai 1M context and 5h/7d usage limits, sound/browser alerts before & after reset or response completion, and auto-click "Try again".
 // @homepageURL  https://github.com/wojtulab/claude-code-usage
 // @supportURL   https://github.com/wojtulab/claude-code-usage/issues
@@ -16,7 +16,28 @@
 (function () {
   'use strict';
 
-  const VERSION = '2.12.19';
+  // R11 storage shim (change in one = change in both): shadows window.localStorage for the whole script. Blocked or full storage falls back
+  // to per-tab memory (cross-tab sharing off) instead of throwing; a key whose write failed stays memory-only so reads never return stale data.
+  const localStorage = (() => {
+    const mem = new Map(), memOnly = new Set();
+    let real = null;
+    try { real = window.localStorage; real.getItem('ide_probe'); } catch (e) { real = null; }
+    const ok = (k) => real && !memOnly.has(k);
+    return {
+      getItem(k) { try { if (ok(k)) return real.getItem(k); } catch (e) {} return mem.has(k) ? mem.get(k) : null; },
+      setItem(k, v) {
+        v = String(v);
+        try { if (real) { real.setItem(k, v); memOnly.delete(k); mem.delete(k); return; } } catch (e) {}
+        mem.set(k, v); memOnly.add(k);
+      },
+      removeItem(k) { mem.delete(k); memOnly.delete(k); try { if (real) real.removeItem(k); } catch (e) {} },
+      get length() { try { if (real) return real.length; } catch (e) {} return mem.size; },
+      key(i) { try { if (real) return real.key(i); } catch (e) {} return [...mem.keys()][i] || null; }
+    };
+  })();
+  // end R11 storage shim
+
+  const VERSION = '2.12.21';
   const TICK_INTERVAL_MS = 1000;             // Countdown, alerts, and button checks every 1s
 
   const lsGet = (k) => { try { return localStorage.getItem(k); } catch (e) { return null; } }; // blocked storage must not stop the script
@@ -37,11 +58,13 @@
     ['doneRepeatSec', 'Response ready: repeat every (s, 0 = off)', 'num', 0, [0, 3600]],
     ['fcMin', 'Forecast: alert if limit ends within (min, 0 = off)', 'num', 30, [0, 1440]],
     ['sessList', 'Session list in overlay (claude.ai/code)', 'bool', true],
-    ['autoAllow', 'Auto-click "Allow once" (permission)', 'bool', false],
+    ['autoAllow', 'Auto-click "Allow once" / "Always allow" (permission)', 'bool', false],
     ['titleInfo', 'Tab title: busy state and %', 'bool', true],
     ['titlePct', 'Tab title %', 'select', 'session', [['session', 'Session (5h)'], ['weekly', 'Weekly (7d)'], ['off', 'Off']]],
     ['titleBlink', 'Response ready: blink ✅ in title + green icon (silent)', 'bool', true],
     ['hiddenOnly', 'Notifications only when tab is in background', 'bool', true],
+    ['volume', 'Alert volume (%, 0 = silent)', 'num', 100, [0, 100]],
+    ['reduceMotion', 'Reduce motion (no pulsing, static blink)', 'bool', false],
     ['quietFrom', 'Quiet hours: from (h, same as to = off)', 'num', 0, [0, 23]],
     ['quietTo', 'Quiet hours: to (h)', 'num', 0, [0, 23]],
     ['opacityIdle', 'Opacity (%)', 'num', 50, [10, 100]],
@@ -65,7 +88,7 @@
   function applyCfg() {
     let st = document.getElementById('claude-usage-overlay-cfgstyle');
     if (!st) { st = document.createElement('style'); st.id = 'claude-usage-overlay-cfgstyle'; document.head.appendChild(st); }
-    st.textContent = `#claude-usage-overlay{opacity:${cfg.opacityIdle / 100} !important}#claude-usage-overlay:hover{opacity:${cfg.opacityHover / 100} !important}`;
+    st.textContent = `#claude-usage-overlay{opacity:${cfg.opacityIdle / 100} !important}#claude-usage-overlay:hover{opacity:${cfg.opacityHover / 100} !important}${cfg.reduceMotion ? '#claude-usage-overlay{animation:none !important}' : ''}`;
   }
 
   // F1: "Connection & data" block in settings: data age, API/backoff state, redacted diagnostics to clipboard.
@@ -360,7 +383,22 @@
   const openNs = new Set(); // open sticky notifications; closeN closes all of them
   function closeN() { openNs.forEach((n) => { try { n.close(); } catch (e) {} }); openNs.clear(); }
   const snoozed = () => { try { if (Date.now() < (+localStorage.getItem('ide_snooze_until') || 0)) return true; } catch (e) {} const f = cfg.quietFrom, t = cfg.quietTo, h = new Date().getHours(); return f !== t && (f < t ? h >= f && h < t : h >= f || h < t); }; // F3: sound and system notifications muted until ts (visual signals stay)
+  // R10: one persistent visually-hidden live region (outside the rebuilt overlay), updated only on alert events (change in one = change in both).
+  function announce(text) {
+    try {
+      let n = document.getElementById('ide-live');
+      if (!n) {
+        n = document.createElement('div'); n.id = 'ide-live';
+        n.setAttribute('role', 'status'); n.setAttribute('aria-live', 'polite');
+        n.style.cssText = 'position:absolute;width:1px;height:1px;overflow:hidden;clip:rect(0 0 0 0);white-space:nowrap;';
+        document.body.appendChild(n);
+      }
+      n.textContent = '';
+      setTimeout(() => { n.textContent = String(text).slice(0, 200); }, 50); // empty first: identical consecutive text is announced again
+    } catch (e) {}
+  }
   function notify(title, body, tag, force, sticky, onClick) {
+    announce(title + (body ? ': ' + body : ''));
     if (snoozed()) return;
     if (cfg.hiddenOnly && !away() && !force) return;
     try {
@@ -422,7 +460,7 @@
 
   // Generic Web Audio API tone sequence player
   function playTones(notes) {
-    if (snoozed()) return;
+    if (snoozed() || !cfg.volume) return;
     const ctx = ensureAudio();
     if (!ctx) return;
     const t0 = Date.now();
@@ -434,7 +472,7 @@
           const gain = ctx.createGain();
           osc.type = type;
           osc.frequency.setValueAtTime(freq, ctx.currentTime + start);
-          gain.gain.setValueAtTime(gainVal, ctx.currentTime + start);
+          gain.gain.setValueAtTime(Math.max(0.002, gainVal * cfg.volume / 100), ctx.currentTime + start);
           gain.gain.exponentialRampToValueAtTime(0.001, ctx.currentTime + start + duration);
           osc.connect(gain);
           gain.connect(ctx.destination);
@@ -754,6 +792,10 @@
     for (const btn of document.querySelectorAll('[data-approval-allow] button')) {
       if (okBtn(btn) && /^Allow(?:\s+once)?(?:\s*(?:Ctrl|⌘|Enter|⏎|↵).*)?$/i.test(cleanBtnText(btn))) return btn;
     }
+    // Owner's choice (18.11.2026): a card with only "Always allow" (no "Allow once") is clicked too — same setting.
+    for (const btn of document.querySelectorAll('[data-approval-allow] button')) {
+      if (okBtn(btn) && /^Always\s+allow(?:\s*(?:Ctrl|Shift|⌘|Enter|⏎|↵).*)?$/i.test(cleanBtnText(btn))) return btn;
+    }
     return null;
   }
   function tryAutoAllow() {
@@ -777,7 +819,7 @@
     lastAutoAllowAt = now;
     diag('auto-allow');
     btn.click();
-    setNote('🤖 Auto-clicked "Allow once"', 10000);
+    setNote('🤖 Auto-clicked "' + cleanBtnText(btn).slice(0, 20) + '"', 10000);
     renderOverlay();
     return true;
   }
@@ -850,7 +892,7 @@
     else if (!qActive) qBlink = false;
     setFav(qActive && away() ? '#f97316' : (titleDone && cfg.titleBlink ? '#22c55e' : ''));
     const base = document.title.replace(TITLE_PREFIX_RE, '');
-    const blinkHide = (Math.floor(Date.now() / 1000) % 2 === 1);
+    const blinkHide = !cfg.reduceMotion && (Math.floor(Date.now() / 1000) % 2 === 1);
     let alertPart = '';
     if (qActive) {
       alertPart = (away() && blinkHide) ? '' : '❓ ';
@@ -1238,6 +1280,7 @@
         <div style="font-weight:bold;margin-bottom:4px;display:flex;justify-content:space-between;align-items:center;">
           <span style="color:#ff6b6b">⚠️ Claude API Error</span>
           <span style="display:inline-flex;align-items:center;gap:6px;">
+            <button type="button" id="claude-refresh-btn" title="Refresh now" aria-label="Refresh now" style="background:none;border:0;color:inherit;font-family:inherit;line-height:1;cursor:pointer;font-size:13px;">⟳</button>
             <button type="button" id="claude-min-btn" title="Minimize" aria-label="Minimize" style="background:none;border:0;color:inherit;font-family:inherit;line-height:1;cursor:pointer;font-size:13px;font-weight:bold;padding:0 2px;">–</button>
             <button type="button" id="claude-cfg-btn" title="Settings" aria-label="Settings" style="background:none;border:0;color:inherit;font-family:inherit;line-height:1;cursor:pointer;font-size:13px;font-weight:normal;">⚙</button>
           </span>
@@ -1294,6 +1337,7 @@
         <div style="font-weight:bold;margin-bottom:6px;display:flex;justify-content:space-between;align-items:center;border-bottom:1px solid #333;padding-bottom:4px;">
           <span>📊 Claude Monitor</span>
           <span style="display:inline-flex;align-items:center;gap:6px;">
+            <button type="button" id="claude-refresh-btn" title="Refresh now" aria-label="Refresh now" style="background:none;border:0;color:inherit;font-family:inherit;line-height:1;cursor:pointer;font-size:13px;">⟳</button>
             <button type="button" id="claude-min-btn" title="Minimize" aria-label="Minimize" style="background:none;border:0;color:inherit;font-family:inherit;line-height:1;cursor:pointer;font-size:13px;font-weight:bold;padding:0 2px;">–</button>
             <button type="button" id="claude-cfg-btn" title="Settings" aria-label="Settings" style="background:none;border:0;color:inherit;font-family:inherit;line-height:1;cursor:pointer;font-size:13px;font-weight:normal;">⚙</button>
           </span>
@@ -1328,9 +1372,9 @@
               🔊 Test
             </button>
           </div>
-          <label style="display:flex;align-items:center;gap:5px;cursor:pointer;color:${cfg.autoAllow ? '#ffb74d' : '#ccc'};font-size:10px;margin-top:4px;" title="Automatically clicks 'Allow once' on command/tool permission prompts (use carefully!)">
+          <label style="display:flex;align-items:center;gap:5px;cursor:pointer;color:${cfg.autoAllow ? '#ffb74d' : '#ccc'};font-size:10px;margin-top:4px;" title="Automatically clicks 'Allow once' (or 'Always allow' when it is the only option) on command/tool permission prompts (use carefully!)">
             <input id="claude-auto-allow-cb" type="checkbox" ${cfg.autoAllow ? 'checked' : ''} style="cursor:pointer;margin:0;">
-            <span>Auto-click "Allow once"</span>
+            <span>Auto-click "Allow once" / "Always allow"</span>
           </label>
         </div>
 
@@ -1357,6 +1401,12 @@
         try { localStorage.setItem('claude_overlay_cfg_v1', JSON.stringify(cfg)); } catch (err) {}
         renderOverlay();
       };
+    }
+
+    const refBtn = document.getElementById('claude-refresh-btn');
+    if (refBtn) {
+      refBtn.onpointerdown = (e) => { e.stopPropagation(); e.preventDefault(); };
+      refBtn.onclick = (e) => { e.stopPropagation(); updateAll(true); };
     }
 
     const gearBtn = document.getElementById('claude-cfg-btn');
@@ -1412,7 +1462,7 @@
 
     let drag = null, moved = false;
     el.addEventListener('pointerdown', (e) => {
-      if (e.button !== 0 || e.target.closest('input,label,button,[data-sess],#claude-cfg-btn,#claude-min-btn')) return; // pointer capture would swallow clicks
+      if (e.button !== 0 || e.target.closest('input,label,button,[data-sess],#claude-cfg-btn,#claude-min-btn,#claude-refresh-btn')) return; // pointer capture would swallow clicks
       const r = el.getBoundingClientRect();
       drag = { dx: e.clientX - r.left, dy: e.clientY - r.top, sx: e.clientX, sy: e.clientY };
       moved = false;
