@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Claude.ai Usage & Context Overlay (DOM Sync v2.2)
 // @namespace    https://github.com/wojtulab/claude-code-usage
-// @version      2.12.4
+// @version      2.12.7
 // @description  Monitor Claude.ai 1M context and 5h/7d usage limits, sound/browser alerts before & after reset or response completion, and auto-click "Try again".
 // @homepageURL  https://github.com/wojtulab/claude-code-usage
 // @supportURL   https://github.com/wojtulab/claude-code-usage/issues
@@ -16,7 +16,7 @@
 (function () {
   'use strict';
 
-  const VERSION = '2.12.4';
+  const VERSION = '2.12.7';
   const TICK_INTERVAL_MS = 1000;             // Countdown, alerts, and button checks every 1s
 
   // Settings: ⚙ panel in overlay header, saved to localStorage (claude_overlay_cfg_v1). CFG_SCHEMA entries: [key, label, type, default].
@@ -142,6 +142,7 @@
   let lastClickedCycleTs = 0;
 
   const STATE_KEY = 'claude_overlay_state_v1';
+  const BLOCK_KEY = 'claude_overlay_block_until'; // shared API backoff deadline (ts)
   let statusNoteUntil = 0;
   let lastSuccessTs = 0;
 
@@ -178,6 +179,7 @@
     if (typeof d.lastUpdated === 'string') clean.lastUpdated = d.lastUpdated.slice(0, 40);
     else if (d.lastUpdated === null) clean.lastUpdated = null;
     if (typeof d.fetchedAt === 'number' && Number.isFinite(d.fetchedAt) && d.fetchedAt > 0) clean.fetchedAt = d.fetchedAt;
+    if (cachedOrgId && d.orgId !== cachedOrgId) return null; // cache of another org (or untagged legacy cache)
     return Object.keys(clean).length ? clean : null;
   }
 
@@ -389,26 +391,66 @@
     }
   }
 
+  // 429/401 → backoff error; Retry-After (seconds) is honoured by updateAll
+  const backoffErr = (res, what) => Object.assign(new Error(`HTTP ${what} Error: ${res.status}`), {
+    backoff: true, retryAfterMs: Math.max(0, parseInt(res.headers.get('retry-after'), 10) || 0) * 1000
+  });
+  const API_TIMEOUT_MS = 15000; // hung request must release `updating`
+
+  // Active org: claude.ai sets cookie `lastActiveOrg` (when not HttpOnly); fallback orgs[0]
+  function activeOrgCookie() {
+    const m = document.cookie.match(/(?:^|;\s*)lastActiveOrg=([^;]+)/);
+    try { return m ? decodeURIComponent(m[1]) : null; } catch (e) { return null; }
+  }
+
+  function switchOrg(id) {
+    if (cachedOrgId && cachedOrgId !== id) { // other org/account: never show previous limits
+      Object.assign(state, { sessionPct: '?', weeklyPct: '?', sessionResetTs: null, weeklyResetTs: null, lastUpdated: null });
+      try { localStorage.removeItem(STATE_KEY); } catch (e) {}
+    }
+    cachedOrgId = id;
+    try { localStorage.setItem('claude_overlay_org_id', id); } catch (e) {}
+  }
+
   async function getOrgId() {
-    if (cachedOrgId) return cachedOrgId;
+    const active = activeOrgCookie();
+    if (cachedOrgId && (!active || active === cachedOrgId)) return cachedOrgId;
     const orgsRes = await fetch('/api/organizations', {
       credentials: 'same-origin',
-      headers: { 'accept': 'application/json' }
+      headers: { 'accept': 'application/json' },
+      signal: AbortSignal.timeout(API_TIMEOUT_MS)
     });
-    if (orgsRes.status === 429 || orgsRes.status === 401) throw Object.assign(new Error(`HTTP Org Error: ${orgsRes.status}`), { backoff: true });
+    if (orgsRes.status === 429 || orgsRes.status === 401) throw backoffErr(orgsRes, 'Org');
     if (!orgsRes.ok) throw new Error(`HTTP Org Error: ${orgsRes.status}`);
     const orgs = await orgsRes.json();
-    if (!orgs || !orgs.length) throw new Error('No organization found');
-    cachedOrgId = orgs[0].uuid || orgs[0].id;
-    localStorage.setItem('claude_overlay_org_id', cachedOrgId);
-    return cachedOrgId;
+    if (!Array.isArray(orgs) || !orgs.length) throw new Error('No organization found');
+    const ids = orgs.map((o) => o && (o.uuid || o.id)).filter(Boolean);
+    const id = ids.includes(active) ? active : ids[0];
+    if (!id) throw new Error('No organization found');
+    switchOrg(id);
+    return id;
   }
+
+  // percent must be a finite number in 0..100, reset must be a valid date; anything else = API error (previous reading stays, marked stale)
+  const apiPct = (o, what) => {
+    if (o?.utilization == null) return '?';
+    const v = Number(o.utilization);
+    if (typeof o.utilization === 'boolean' || !Number.isFinite(v) || v < 0 || v > 100) throw new Error(`Invalid ${what} utilization`);
+    return Math.round(v);
+  };
+  const apiTs = (raw, what) => {
+    if (!raw) return null;
+    const t = new Date(raw).getTime();
+    if (!Number.isFinite(t)) throw new Error(`Invalid ${what} resets_at`);
+    return t;
+  };
 
   async function fetchUsageFromApi() {
     const orgId = await getOrgId();
     const usageRes = await fetch(`/api/organizations/${orgId}/usage`, {
       credentials: 'same-origin',
-      headers: { 'accept': 'application/json' }
+      headers: { 'accept': 'application/json' },
+      signal: AbortSignal.timeout(API_TIMEOUT_MS)
     });
 
     if (usageRes.status === 403 || usageRes.status === 404) {
@@ -416,23 +458,17 @@
       localStorage.removeItem('claude_overlay_org_id');
       throw new Error('Expired org ID');
     }
-    if (usageRes.status === 429 || usageRes.status === 401) throw Object.assign(new Error(`HTTP Usage Error: ${usageRes.status}`), { backoff: true });
+    if (usageRes.status === 429 || usageRes.status === 401) throw backoffErr(usageRes, 'Usage');
     if (!usageRes.ok) throw new Error(`HTTP Usage Error: ${usageRes.status}`);
 
     const data = await usageRes.json();
 
-    const sessionPct = data.five_hour?.utilization != null
-      ? Math.round(data.five_hour.utilization)
-      : '?';
-    const sessionResetTs = data.five_hour?.resets_at
-      ? new Date(data.five_hour.resets_at).getTime()
-      : null;
-
-    const weeklyPct = data.seven_day?.utilization != null
-      ? Math.round(data.seven_day.utilization)
-      : (data.weekly_all?.utilization != null ? Math.round(data.weekly_all.utilization) : '?');
-    const weeklyRaw = data.seven_day?.resets_at || data.weekly_all?.resets_at;
-    const weeklyResetTs = weeklyRaw ? new Date(weeklyRaw).getTime() : null;
+    if (!data || typeof data !== 'object') throw new Error('Invalid usage payload');
+    const wk = data.seven_day || data.weekly_all;
+    const sessionPct = apiPct(data.five_hour, 'session');
+    const sessionResetTs = apiTs(data.five_hour?.resets_at, 'session');
+    const weeklyPct = apiPct(wk, 'weekly');
+    const weeklyResetTs = apiTs(wk?.resets_at, 'weekly');
 
     return { sessionPct, weeklyPct, sessionResetTs, weeklyResetTs };
   }
@@ -707,7 +743,10 @@
     while (h.length && now - h[0].t > 7 * 3600e3) h.shift();
     try { localStorage.setItem('claude_overlay_hist_v1', JSON.stringify(hist)); } catch (e) {}
   }
+  // Data age: a failed request (state.stale) or a last successful read older than max(10 min, 3 refreshes) = stale.
+  const isStale = () => !!state.stale || (!!lastSuccessTs && Date.now() - lastSuccessTs > Math.max(600000, cfg.refreshSec * 3000));
   function forecast(kind) {
+    if (isStale()) return null; // old reading must not produce forecast/alert
     const now = Date.now(), pts = (hist[kind] || []).filter((p) => now - p.t <= FC_WIN[kind]);
     if (pts.length < 2) return null;
     const a = pts[0], b = pts[pts.length - 1], drop = a.v - b.v, dt = (b.t - a.t) / 3600e3;
@@ -801,9 +840,10 @@
   }
 
   // Response ready (open chat): "Stop response" button (or data-is-streaming) disappears for >=2s.
-  let genSince = 0, genIdleAt = 0;
+  let genSince = 0, genIdleAt = 0, genPath = location.pathname;
   function detectResponseDone() {
     const now = Date.now();
+    if (location.pathname !== genPath) { genPath = location.pathname; genSince = 0; genIdleAt = 0; } // SPA switched chat: don't report the old one as done
     const stopBtn = document.querySelector('button[aria-label^="Stop" i], [data-is-streaming="true"]');
     if (stopBtn) {
       if (!genSince) { genSince = now; diag('stop+'); }
@@ -818,7 +858,10 @@
     genSince = 0; genIdleAt = 0;
     markDone();
     if (dur < cfg.doneMinSec * 1000) { diag('too-short', { s: Math.round(dur / 1000) }); return; }
-    alertDone(document.title.replace(TITLE_PREFIX_RE, '').replace(/\s*[-–|]\s*Claude\s*$/i, ''), 'claude-done');
+    // tag = active sidebar row (same as detectRowsDone) so Stop and sidebar share one alert and other sessions aren't suppressed; no row → global 'claude-done'
+    const curRow = document.querySelector('[data-row-key] [aria-current="page"]');
+    const curKey = curRow && curRow.closest('[data-row-key]').getAttribute('data-row-key');
+    alertDone(document.title.replace(TITLE_PREFIX_RE, '').replace(/\s*[-–|]\s*Claude\s*$/i, ''), curKey ? 'claude-row-' + curKey : 'claude-done');
   }
 
   // Sidebar sessions (claude.ai/code): active `[data-row-key]` row has a dot in `[data-row-decoration]`:
@@ -1021,7 +1064,7 @@
       const wTxt = state.weeklyPct === '?' ? '?' : `${state.weeklyPct}%`;
       const pill = state.error
         ? `<span style="color:#ff6b6b;font-weight:bold;">⚠️ API Error</span>`
-        : `<span>📊 Weekly: <b style="color:${getColorForPct(state.weeklyPct)}">${wTxt}</b> · 5h: <b style="color:${getColorForPct(state.sessionPct)}">${sTxt}</b></span>`;
+        : `<span>📊 Weekly: <b style="color:${getColorForPct(state.weeklyPct)}">${wTxt}</b> · 5h: <b style="color:${getColorForPct(state.sessionPct)}">${sTxt}</b>${isStale() ? ' <span title="Stale data" style="color:#ff8a80">⌛</span>' : ''}</span>`;
       html = `<div style="display:flex;align-items:center;gap:8px;white-space:nowrap;font-size:11px;">
         ${pill}
         <span style="display:inline-flex;align-items:center;gap:6px;margin-left:auto;">
@@ -1132,7 +1175,7 @@
 
         <div style="font-size:9px;color:#666;margin-top:5px;border-top:1px solid #333;padding-top:4px;display:flex;justify-content:space-between;">
           <span>Auto: ${cfg.refreshSec}s · v${VERSION}</span>
-          <span ${state.stale ? 'style="color:#ff8a80" title="Last API request failed (attempt ' + esc(state.lastTry) + ')"' : ''}>Status: ${esc(state.lastUpdated) || '...'}${state.stale ? ' ⚠ stale' : ''}</span>
+          <span ${isStale() ? 'style="color:#ff8a80" title="Old data or last API request failed (attempt ' + esc(state.lastTry) + ')"' : ''}>Status: ${esc(state.lastUpdated) || '...'}${isStale() ? ' ⚠ stale' : ''}</span>
         </div>
       `;
     }
@@ -1236,7 +1279,9 @@
     lastApiAt = Date.now();
     const contextData = scrapeContextFromDOM();
     Object.assign(state, contextData);
-    if (force !== true && Date.now() < apiBlockedUntil) { renderOverlay(); return; }
+    let sharedBlock = 0; // backoff shared between tabs (another tab already got 429)
+    try { sharedBlock = +localStorage.getItem(BLOCK_KEY) || 0; } catch (e) {}
+    if (force !== true && Date.now() < Math.max(apiBlockedUntil, sharedBlock)) { renderOverlay(); return; }
     updating = true;
 
     const t = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
@@ -1244,6 +1289,7 @@
       const prevResetTs = state.sessionResetTs;
       const usageData = await fetchUsageFromApi();
       backoffMs = 0; apiBlockedUntil = 0;
+      try { localStorage.removeItem(BLOCK_KEY); } catch (e) {}
       Object.assign(state, usageData, { error: false, stale: false, lastUpdated: t });
       const now = Date.now();
       lastSuccessTs = now;
@@ -1266,6 +1312,7 @@
           extraUsed: state.extraUsed,
           extraLimit: state.extraLimit,
           lastUpdated: state.lastUpdated,
+          orgId: cachedOrgId,
           fetchedAt: now
         }));
       } catch (e) {}
@@ -1279,7 +1326,9 @@
       if (state.sessionPct === '?') state.error = true;
       if (err && err.backoff) { // 429/401: double interval (start at 2× refreshSec), max 10 min
         backoffMs = Math.min(600000, backoffMs ? backoffMs * 2 : Math.max(2, cfg.refreshSec) * 2000);
+        backoffMs = Math.min(600000, Math.max(backoffMs, err.retryAfterMs || 0));
         apiBlockedUntil = Date.now() + backoffMs;
+        try { localStorage.setItem(BLOCK_KEY, String(apiBlockedUntil)); } catch (e) {}
         diag('backoff', { s: Math.round(backoffMs / 1000) });
       }
     } finally { updating = false; }
