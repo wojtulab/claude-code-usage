@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Claude.ai Usage & Context Overlay (DOM Sync v2.2)
 // @namespace    https://github.com/wojtulab/claude-code-usage
-// @version      2.12.17
+// @version      2.12.18
 // @description  Monitor Claude.ai 1M context and 5h/7d usage limits, sound/browser alerts before & after reset or response completion, and auto-click "Try again".
 // @homepageURL  https://github.com/wojtulab/claude-code-usage
 // @supportURL   https://github.com/wojtulab/claude-code-usage/issues
@@ -16,7 +16,7 @@
 (function () {
   'use strict';
 
-  const VERSION = '2.12.17';
+  const VERSION = '2.12.18';
   const TICK_INTERVAL_MS = 1000;             // Countdown, alerts, and button checks every 1s
 
   const lsGet = (k) => { try { return localStorage.getItem(k); } catch (e) { return null; } }; // blocked storage must not stop the script
@@ -713,7 +713,13 @@
     }
     return null;
   }
-  const allowClicks = new WeakMap();
+  // Click guard per approval: same button node AND same card text; a reused node (React keeps the element for the next command)
+  // or a record older than 30 s starts again, otherwise auto-click would die for good after 2 clicks.
+  let allowRec = { btn: null, sig: '', count: 0, at: 0 }, lastAllowDiagAt = 0;
+  function allowSig(btn) {
+    const c = btn.closest('[data-approval-allow]'), card = (c && c.parentElement) || btn.parentElement;
+    return ((card && card.textContent) || '').replace(/\s+/g, ' ').slice(0, 300);
+  }
   let lastAutoAllowAt = 0;
   function cleanBtnText(btn) {
     if (!btn.querySelector('kbd, [data-cds="Shortcut"], .sr-only')) return (btn.textContent || '').replace(/\s+/g, ' ').trim();
@@ -742,6 +748,10 @@
         }
       }
     }
+    // The card may be rendered outside <main>/dialog (e.g. next to the composer): the [data-approval-allow] marker is specific enough to search the whole page.
+    for (const btn of document.querySelectorAll('[data-approval-allow] button')) {
+      if (okBtn(btn) && /^Allow(?:\s+once)?(?:\s*(?:Ctrl|⌘|Enter|⏎|↵).*)?$/i.test(cleanBtnText(btn))) return btn;
+    }
     return null;
   }
   function tryAutoAllow() {
@@ -749,10 +759,19 @@
     const now = Date.now();
     if (now - lastAutoAllowAt < 800) return false;
     const btn = findAllowOnceBtn();
-    if (!btn) return false;
-    const rec = allowClicks.get(btn) || { count: 0, at: 0 };
-    if (rec.count >= 2 || now - rec.at < 3000) return false;
-    allowClicks.set(btn, { count: rec.count + 1, at: now });
+    if (!btn) {
+      allowRec = { btn: null, sig: '', count: 0, at: 0 };
+      const card = document.querySelector('[data-approval-allow]');
+      if (card && now - lastAllowDiagAt > 10000) { // card visible but no "Allow once" (e.g. only "Always allow"): leave a trace without the command text
+        lastAllowDiagAt = now;
+        diag('allow-nobtn', { btns: [...card.parentElement.querySelectorAll('button')].slice(0, 4).map((b) => cleanBtnText(b).slice(0, 24)).join('|') });
+      }
+      return false;
+    }
+    const sig = allowSig(btn);
+    if (allowRec.btn !== btn || allowRec.sig !== sig || now - allowRec.at > 30000) allowRec = { btn, sig, count: 0, at: 0 };
+    if (allowRec.count >= 2 || now - allowRec.at < 3000) return false;
+    allowRec = { btn, sig, count: allowRec.count + 1, at: now };
     lastAutoAllowAt = now;
     diag('auto-allow');
     btn.click();
