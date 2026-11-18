@@ -8,7 +8,7 @@
   <a href="https://raw.githubusercontent.com/wojtulab/claude-code-usage/main/claude-usage.user.js">
     <img src="https://img.shields.io/badge/Install%20with-Tampermonkey-00485B?style=for-the-badge&logo=tampermonkey&logoColor=white" alt="Install with Tampermonkey">
   </a>
-  <img src="https://img.shields.io/badge/version-2.12.23-blue?style=for-the-badge" alt="Version 2.12.23">
+  <img src="https://img.shields.io/badge/version-2.12.24-blue?style=for-the-badge" alt="Version 2.12.24">
   <img src="https://img.shields.io/badge/license-MIT-green?style=for-the-badge" alt="MIT License">
   <img src="https://img.shields.io/badge/grant-none%20(zero%20sandbox)-lightgrey?style=for-the-badge" alt="Grant none">
 </p>

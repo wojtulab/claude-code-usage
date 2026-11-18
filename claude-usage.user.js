@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Claude.ai Usage & Context Overlay (DOM Sync v2.2)
 // @namespace    https://github.com/wojtulab/claude-code-usage
-// @version      2.12.23
+// @version      2.12.24
 // @description  Monitor Claude.ai 1M context and 5h/7d usage limits, sound/browser alerts before & after reset or response completion, and auto-click "Try again".
 // @homepageURL  https://github.com/wojtulab/claude-code-usage
 // @supportURL   https://github.com/wojtulab/claude-code-usage/issues
@@ -37,7 +37,7 @@
   })();
   // end R11 storage shim
 
-  const VERSION = '2.12.23';
+  const VERSION = '2.12.24';
   const TICK_INTERVAL_MS = 1000;             // Countdown, alerts, and button checks every 1s
 
   const lsGet = (k) => { try { return localStorage.getItem(k); } catch (e) { return null; } }; // blocked storage must not stop the script
@@ -868,16 +868,18 @@
       rowDone.delete(key);
       active.set(key, { title: rowLabel(row) || key, current });
     });
-    if (!curRowHasQ && !(cfg.autoAllow && Date.now() - lastAutoAllowAt < 2500) && findChatQuestion()) {
+    const chatEl = !curRowHasQ && !(cfg.autoAllow && Date.now() - lastAutoAllowAt < 2500) ? findChatQuestion() : null;
+    if (chatEl) {
+      const desc = chatEl.tagName.toLowerCase() + '|' + (chatEl.getAttribute('aria-label') || '').slice(0, 40) + '|' + (chatEl.getAttribute('data-testid') || '').slice(0, 40); // attribute names only, never page text
       const chatTitle = document.title.replace(TITLE_PREFIX_RE, '').replace(/\s*[-–|]\s*Claude\s*$/i, '') || 'Claude';
-      active.set('chat', { title: chatTitle, current: true });
+      active.set('chat', { title: chatTitle, current: true, desc });
     }
     for (const k of [...qMap.keys()]) {
       if (!active.has(k)) qMap.delete(k);
     }
     const fireQ = (key, info) => claimOnce('claude-q-' + key, 5000).then((ok) => {
-      if (!ok) { diag('claim-lost', { k: 'q' }); return; }
-      diag('q-alert', { k: key.slice(-12) });
+      if (!ok) { diag('claim-lost', { c: 'q' }); return; }
+      diag('q-alert', { q: key.slice(-12), el: info.desc || '' }); // field must not be `k`: it would overwrite the event name
       if (cfg.qSound) playQuestionBeep();
       if (cfg.qNotify) {
         notify('Claude needs approval', info.title, 'claude-q-' + key, !info.current, true,
@@ -1033,7 +1035,7 @@
       try { localStorage.setItem('claude_overlay_fc_v1', JSON.stringify(fcAlerted)); } catch (e) {}
       const body = `${label}: ~${fmtDur(f.etaMs)} left at ${f.rate.toFixed(1)}%/h (resets in ${fmtDur(rts - Date.now())})`;
       claimOnce('fc-' + kind + '-' + rts, 600000).then((ok) => {
-        if (!ok) { diag('claim-lost', { k: 'fc' }); return; }
+        if (!ok) { diag('claim-lost', { c: 'fc' }); return; }
         if (cfg.soundContext) playContextAlertBeep();
         notify('Claude: limit running out', body, 'claude-fc-' + kind);
       });
@@ -1053,7 +1055,7 @@
   let doneAlert = null; // last fired "done" alert, repeated every doneRepeatSec while still unvisited (like AG dRepeatSec)
   function fireDone(title, tag, force, sessKey) {
     claimOnce('done-' + tag + '-' + title, cfg.doneRepeatSec ? Math.min(10000, Math.max(500, cfg.doneRepeatSec * 500)) : 10000).then((ok) => {
-      if (!ok) { diag('claim-lost', { k: 'done' }); return; }
+      if (!ok) { diag('claim-lost', { c: 'done' }); return; }
       if (cfg.doneSound) playDoneBeep();
       if (cfg.doneNotify) notify('Claude responded', title, tag, force, true, sessKey ? () => { openSession(sessKey); applyTitle(); } : null);
     });
