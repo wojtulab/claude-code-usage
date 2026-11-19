@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Claude.ai Usage & Context Overlay (DOM Sync v2.2)
 // @namespace    https://github.com/wojtulab/claude-code-usage
-// @version      2.12.24
+// @version      2.12.25
 // @description  Monitor Claude.ai 1M context and 5h/7d usage limits, sound/browser alerts before & after reset or response completion, and auto-click "Try again".
 // @homepageURL  https://github.com/wojtulab/claude-code-usage
 // @supportURL   https://github.com/wojtulab/claude-code-usage/issues
@@ -37,7 +37,7 @@
   })();
   // end R11 storage shim
 
-  const VERSION = '2.12.24';
+  const VERSION = '2.12.25';
   const TICK_INTERVAL_MS = 1000;             // Countdown, alerts, and button checks every 1s
 
   const lsGet = (k) => { try { return localStorage.getItem(k); } catch (e) { return null; } }; // blocked storage must not stop the script
@@ -82,13 +82,22 @@
   }
   normCfg();
   cfg.minimized = !!cfg.minimized;
-  cfg.autoAllow = !!cfg.autoAllow;
-  if (!['session', 'weekly', 'off'].includes(cfg.titlePct)) cfg.titlePct = 'session';
 
   function applyCfg() {
     let st = document.getElementById('claude-usage-overlay-cfgstyle');
     if (!st) { st = document.createElement('style'); st.id = 'claude-usage-overlay-cfgstyle'; document.head.appendChild(st); }
-    st.textContent = `#claude-usage-overlay{opacity:${cfg.opacityIdle / 100} !important}#claude-usage-overlay:hover{opacity:${cfg.opacityHover / 100} !important}${cfg.reduceMotion ? '#claude-usage-overlay{animation:none !important}' : ''}`;
+    st.textContent = `#claude-usage-overlay{opacity:${cfg.opacityIdle / 100} !important}#claude-usage-overlay:hover,#claude-usage-overlay:focus-within{opacity:${cfg.opacityHover / 100} !important}${cfg.reduceMotion ? '#claude-usage-overlay{animation:none !important}' : ''}`;
+  }
+
+  function syncPanelInputs() {
+    const p = document.getElementById('claude-usage-overlay-cfg');
+    if (!p) return;
+    p.querySelectorAll('[data-cfg-key]').forEach((inp) => {
+      const k = inp.dataset.cfgKey;
+      if (!(k in cfg)) return;
+      if (inp.type === 'checkbox') inp.checked = !!cfg[k];
+      else inp.value = cfg[k];
+    });
   }
 
   // F1: "Connection & data" block in settings: data age, API/backoff state, redacted diagnostics to clipboard.
@@ -140,7 +149,15 @@
     };
     const ta = document.createElement('textarea'); ta.placeholder = 'Paste exported settings JSON here'; ta.rows = 2;
     ta.style.cssText = 'display:block;width:100%;box-sizing:border-box;margin-top:3px;background:#2d2d2d;color:#e0e0e0;border:1px solid #555;border-radius:4px;font-size:10px;';
-    const save = () => { normCfg(); try { localStorage.setItem(CFG_KEY, JSON.stringify(cfg)); } catch (e) {} applyCfg(); renderOverlay(); };
+    const save = () => {
+      normCfg();
+      cfg.minimized = !!cfg.minimized;
+      try { localStorage.setItem(CFG_KEY, JSON.stringify(cfg)); } catch (e) {}
+      syncPanelInputs();
+      applyCfg();
+      if (cfg.autoAllow) tryAutoAllow();
+      renderOverlay();
+    };
     const exportJson = () => JSON.stringify({ ide: IDE_KIND, v: 1, cfg: Object.fromEntries([...CFG_SCHEMA.map((x) => x[0]), 'minimized'].map((k) => [k, cfg[k]])) }, null, 2);
     box.append(h,
       mk('Copy settings', () => { try { navigator.clipboard.writeText(exportJson()).then(() => { note.textContent = 'Settings copied'; }, () => { note.textContent = 'Copy failed'; }); } catch (e) { note.textContent = 'Copy failed'; } }),
@@ -151,7 +168,7 @@
         let d; try { d = JSON.parse(ta.value); } catch (e) { note.textContent = 'Invalid JSON'; return; }
         if (!d || d.ide !== IDE_KIND || d.v !== 1 || !d.cfg || typeof d.cfg !== 'object') { note.textContent = 'Not a ' + IDE_KIND + ' settings export'; return; }
         const keys = [...CFG_SCHEMA.map((x) => x[0]), 'minimized'].filter((k) => k in d.cfg);
-        keys.forEach((k) => { cfg[k] = d.cfg[k]; });
+        keys.forEach((k) => { if (k === 'minimized') { if (typeof d.cfg.minimized === 'boolean') cfg.minimized = d.cfg.minimized; } else cfg[k] = d.cfg[k]; });
         save(); note.textContent = 'Imported ' + keys.length + ' settings (invalid values reset to allowed ranges)';
       }), note);
     return box;
@@ -169,8 +186,7 @@
       Object.keys(PRESET_GROUPS).forEach((g) => PRESET_GROUPS[g].forEach((k) => { cfg[k] = on.includes(g); }));
       normCfg();
       try { localStorage.setItem('claude_overlay_cfg_v1', JSON.stringify(cfg)); } catch (e) {}
-      const rows = box.parentElement ? box.parentElement.querySelectorAll(':scope > label') : [];
-      CFG_SCHEMA.forEach(([k, , type], idx) => { const inp = rows[idx] && rows[idx].querySelector('input'); if (inp && type === 'bool') inp.checked = !!cfg[k]; });
+      syncPanelInputs();
       if (on.length) askNotifyPermission();
       applyCfg(); renderOverlay();
       note.textContent = label + ' applied';
@@ -198,7 +214,7 @@
     const mk = (label, min) => {
       const b = document.createElement('button'); b.type = 'button'; b.textContent = label;
       b.style.cssText = 'margin:2px 4px 2px 0;background:#2d2d2d;color:#bbb;border:1px solid #444;border-radius:4px;padding:1px 6px;font-size:10px;cursor:pointer;';
-      b.onclick = () => { try { if (min) localStorage.setItem('ide_snooze_until', String(Date.now() + min * 60000)); else localStorage.removeItem('ide_snooze_until'); } catch (e) {} show(); };
+      b.onclick = () => { try { if (min) localStorage.setItem('ide_snooze_until', String(Date.now() + min * 60000)); else localStorage.removeItem('ide_snooze_until'); } catch (e) {} show(); renderOverlay(); };
       return b;
     };
     box.append(h, mk('15 min', 15), mk('60 min', 60), mk('Off', 0), note);
@@ -233,6 +249,7 @@
         i.type = type === 'bool' ? 'checkbox' : 'number';
         if (type === 'bool') i.checked = !!cfg[k]; else { i.value = cfg[k]; i.style.width = '56px'; }
       }
+      i.dataset.cfgKey = k;
       i.onchange = () => {
         if (type === 'select') cfg[k] = opts.some(([v]) => v === i.value) ? i.value : def;
         else if (type === 'bool') cfg[k] = i.checked;
@@ -333,10 +350,6 @@
     if ((typeof d.weeklyPct === 'number' && Number.isFinite(d.weeklyPct)) || d.weeklyPct === '?') clean.weeklyPct = d.weeklyPct;
     if ((typeof d.sessionResetTs === 'number' && Number.isFinite(d.sessionResetTs) && d.sessionResetTs > 0) || d.sessionResetTs === null) clean.sessionResetTs = d.sessionResetTs;
     if ((typeof d.weeklyResetTs === 'number' && Number.isFinite(d.weeklyResetTs) && d.weeklyResetTs > 0) || d.weeklyResetTs === null) clean.weeklyResetTs = d.weeklyResetTs;
-    if (typeof d.extraEnabled === 'boolean') clean.extraEnabled = d.extraEnabled;
-    if ((typeof d.extraPct === 'number' && Number.isFinite(d.extraPct)) || d.extraPct === '?') clean.extraPct = d.extraPct;
-    if ((typeof d.extraUsed === 'number' && Number.isFinite(d.extraUsed)) || d.extraUsed === null) clean.extraUsed = d.extraUsed;
-    if ((typeof d.extraLimit === 'number' && Number.isFinite(d.extraLimit)) || d.extraLimit === null) clean.extraLimit = d.extraLimit;
     if (typeof d.lastUpdated === 'string') clean.lastUpdated = d.lastUpdated.slice(0, 40);
     else if (d.lastUpdated === null) clean.lastUpdated = null;
     if (typeof d.fetchedAt === 'number' && Number.isFinite(d.fetchedAt) && d.fetchedAt > 0) clean.fetchedAt = d.fetchedAt;
@@ -409,8 +422,8 @@
     }
   }
   const away = () => document.hidden || !document.hasFocus(); // background tab OR unfocused window (second monitor)
-  const openNs = new Set(); // open sticky notifications; closeN closes all of them
-  function closeN() { openNs.forEach((n) => { try { n.close(); } catch (e) {} }); openNs.clear(); }
+  const openNs = new Map(); // open sticky notifications (Notification → tag); closeN closes all or matching tag prefix
+  function closeN(prefix) { openNs.forEach((t, n) => { if (!prefix || t.startsWith(prefix)) { try { n.close(); } catch (e) {} openNs.delete(n); } }); }
   const snoozed = () => { try { if (Date.now() < (+localStorage.getItem('ide_snooze_until') || 0)) return true; } catch (e) {} const f = cfg.quietFrom, t = cfg.quietTo, h = new Date().getHours(); return f !== t && (f < t ? h >= f && h < t : h >= f || h < t); }; // F3: sound and system notifications muted until ts (visual signals stay)
   // R10: one persistent visually-hidden live region (outside the rebuilt overlay), updated only on alert events (change in one = change in both).
   function announce(text) {
@@ -433,7 +446,7 @@
     try {
       if ('Notification' in window && Notification.permission === 'granted') {
         const n = new Notification(title, { body, tag, requireInteraction: !!sticky });
-        if (sticky) openNs.add(n);
+        if (sticky) openNs.set(n, tag || '');
         n.onclick = () => { window.focus(); try { if (onClick) onClick(); } catch (e) {} n.close(); openNs.delete(n); };
       }
     } catch (e) {}
@@ -442,6 +455,7 @@
   // Single shared AudioContext (previously created on every beep).
   let actx = null;
   function ensureAudio() {
+    if (actx && actx.state === 'running') return actx;
     try {
       const AudioCtx = window.AudioContext || window.webkitAudioContext;
       if (!AudioCtx) return null;
@@ -475,7 +489,10 @@
   try {
     for (let i = localStorage.length - 1; i >= 0; i--) {
       const ck = localStorage.key(i);
-      if (ck && ck.startsWith('ide_claim_')) { const c = JSON.parse(localStorage.getItem(ck) || 'null'); if (!c || !(Date.now() - c.t < 3600e3)) localStorage.removeItem(ck); }
+      if (ck && ck.startsWith('ide_claim_')) {
+        try { const c = JSON.parse(localStorage.getItem(ck) || 'null'); if (!c || !(Date.now() - c.t < 3600e3)) localStorage.removeItem(ck); }
+        catch (e) { localStorage.removeItem(ck); }
+      }
     }
   } catch (e) {}
   function diag(k, extra) {
@@ -488,8 +505,8 @@
   window.__claudeDiag = () => { try { const a = JSON.parse(localStorage.getItem(DIAG_KEY) || '[]'); console.table(a); return a; } catch (e) { return []; } };
 
   // Generic Web Audio API tone sequence player
-  function playTones(notes) {
-    if (snoozed() || !cfg.volume) return;
+  function playTones(notes, ignoreSnooze) {
+    if ((!ignoreSnooze && snoozed()) || !cfg.volume) return;
     const ctx = ensureAudio();
     if (!ctx) return;
     const t0 = Date.now();
@@ -530,13 +547,13 @@
   }
 
   // 3. Notification when session recovers (distinct ascending chord)
-  function playSessionResetBeep() {
+  function playSessionResetBeep(ignoreSnooze) {
     playTones([
       { freq: 523.25, start: 0, duration: 0.14, type: 'triangle', gainVal: 0.12 },    // C5
       { freq: 659.25, start: 0.15, duration: 0.14, type: 'triangle', gainVal: 0.12 }, // E5
       { freq: 783.99, start: 0.30, duration: 0.14, type: 'triangle', gainVal: 0.12 }, // G5
       { freq: 1046.50, start: 0.45, duration: 0.35, type: 'triangle', gainVal: 0.13 } // C6
-    ]);
+    ], ignoreSnooze);
   }
 
   // Response ready: short two-tone chime distinct from limit alerts
@@ -580,9 +597,16 @@
     }
   }
 
-  // 429/401 → backoff error; Retry-After (seconds) is honoured by updateAll
+  // 429/401 → backoff error; Retry-After (seconds or HTTP-date) is honoured by updateAll
+  const parseRetryAfter = (raw) => {
+    if (!raw) return 0;
+    const sec = Number(raw);
+    if (Number.isFinite(sec) && sec > 0) return sec * 1000;
+    const dt = Date.parse(raw);
+    return Number.isFinite(dt) ? Math.max(0, dt - Date.now()) : 0;
+  };
   const backoffErr = (res, what) => Object.assign(new Error(`HTTP ${what} Error: ${res.status}`), {
-    backoff: true, retryAfterMs: Math.max(0, parseInt(res.headers.get('retry-after'), 10) || 0) * 1000
+    backoff: true, retryAfterMs: parseRetryAfter(res.headers.get('retry-after'))
   });
   const API_TIMEOUT_MS = 15000; // hung request must release `updating`
 
@@ -593,9 +617,14 @@
   }
 
   function switchOrg(id) {
-    if (cachedOrgId && cachedOrgId !== id) { // other org/account: never show previous limits
+    if (cachedOrgId && cachedOrgId !== id) { // other org/account: never show previous limits or burn-rate history
       Object.assign(state, { sessionPct: '?', weeklyPct: '?', sessionResetTs: null, weeklyResetTs: null, lastUpdated: null });
-      try { localStorage.removeItem(STATE_KEY); } catch (e) {}
+      hist = {}; fcAlerted = {};
+      try {
+        localStorage.removeItem(STATE_KEY);
+        localStorage.removeItem('claude_overlay_hist_v1');
+        localStorage.removeItem('claude_overlay_fc_v1');
+      } catch (e) {}
     }
     cachedOrgId = id;
     try { localStorage.setItem('claude_overlay_org_id', id); } catch (e) {}
@@ -672,10 +701,12 @@
     for (let n = tw.nextNode(); n; n = tw.nextNode()) {
       const v = n.nodeValue;
       if (!v || v.length > 60 || !/used|1M/i.test(v)) continue;
-      if (n.parentElement && n.parentElement.closest('#claude-usage-overlay')) continue;
-      for (let el = n.parentElement, i = 0; el && i < 3; el = el.parentElement, i++) {
+      const pe = n.parentElement;
+      if (!pe || pe.closest('#claude-usage-overlay, #claude-usage-overlay-cfg, pre, code, script, style, noscript, [aria-hidden="true"]')) continue;
+      if (pe.hidden || (typeof pe.checkVisibility === 'function' && !pe.checkVisibility())) continue;
+      for (let el = pe, i = 0; el && i < 3; el = el.parentElement, i++) {
         const t = (el.textContent || '').trim();
-        if (/^\d{1,3}%\s+used$/i.test(t)) { pctVal = parseInt(t, 10); break; }
+        if (/^\d{1,3}%\s+used$/i.test(t)) { const p = parseInt(t, 10); if (p <= 100) pctVal = p; break; }
         if (/\/\s*1M/i.test(t) && t.length < 30) { ratioText = t; break; }
       }
     }
@@ -694,7 +725,7 @@
         }
       } else if (pctVal < cfg.threshold - 3) rec.alerted = false;
       rec.known = true;
-      if (ctxSeen.size > 50) ctxSeen.clear();
+      if (!ctxSeen.has(path) && ctxSeen.size >= 50) ctxSeen.delete(ctxSeen.keys().next().value);
       ctxSeen.set(path, rec);
 
       return {
@@ -791,8 +822,16 @@
   // or a record older than 30 s starts again, otherwise auto-click would die for good after 2 clicks.
   let allowRec = { btn: null, sig: '', count: 0, at: 0 }, lastAllowDiagAt = 0;
   function allowSig(btn) {
-    const c = btn.closest('[data-approval-allow]'), card = (c && c.parentElement) || btn.parentElement;
-    return ((card && card.textContent) || '').replace(/\s+/g, ' ').slice(0, 300);
+    // Climb up from [data-approval-allow] to the full approval card (including the command block above the action buttons)
+    let card = btn.closest('[data-approval-allow]') || btn;
+    for (let i = 0; i < 4 && card.parentElement; i++) {
+      const p = card.parentElement;
+      if (p === document.body || p === document.documentElement || p.tagName === 'MAIN') break;
+      const len = (p.textContent || '').length;
+      if (len > 1200) break;
+      card = p;
+    }
+    return ((card && card.textContent) || '').replace(/\s+/g, ' ').slice(0, 400);
   }
   let lastAutoAllowAt = 0;
   function cleanBtnText(btn) {
@@ -805,10 +844,11 @@
     const scopes = document.querySelectorAll('main, [role="main"], [role="dialog"], [role="alertdialog"]');
     const roots = scopes.length ? scopes : (document.body ? [document.body] : []);
     const okBtn = (btn) => isQuestionEl(btn) && btn.getAttribute('aria-disabled') !== 'true' && !btn.closest('[data-row-key], nav');
+    const approvalBtns = [...document.querySelectorAll('[data-approval-allow] button')].filter(okBtn);
+    for (const btn of approvalBtns) {
+      if (/^Allow(?:\s+once)?(?:\s*(?:Ctrl|⌘|Enter|⏎|↵).*)?$/i.test(cleanBtnText(btn))) return btn;
+    }
     for (const scope of roots) {
-      for (const btn of scope.querySelectorAll('[data-approval-allow] button[data-approval-primary], [data-approval-allow] button')) {
-        if (okBtn(btn) && /^Allow(?:\s+once)?$/i.test(cleanBtnText(btn))) return btn;
-      }
       for (const btn of scope.querySelectorAll('button, [role="button"]')) {
         if (!okBtn(btn)) continue;
         const txt = cleanBtnText(btn);
@@ -822,13 +862,9 @@
         }
       }
     }
-    // The card may be rendered outside <main>/dialog (e.g. next to the composer): the [data-approval-allow] marker is specific enough to search the whole page.
-    for (const btn of document.querySelectorAll('[data-approval-allow] button')) {
-      if (okBtn(btn) && /^Allow(?:\s+once)?(?:\s*(?:Ctrl|⌘|Enter|⏎|↵).*)?$/i.test(cleanBtnText(btn))) return btn;
-    }
     // Owner's choice (18.11.2026): a card with only "Always allow" (no "Allow once") is clicked too — same setting.
-    for (const btn of document.querySelectorAll('[data-approval-allow] button')) {
-      if (okBtn(btn) && /^Always\s+allow(?:\s*(?:Ctrl|Shift|⌘|Enter|⏎|↵).*)?$/i.test(cleanBtnText(btn))) return btn;
+    for (const btn of approvalBtns) {
+      if (/^Always\s+allow(?:\s*(?:Ctrl|Shift|⌘|Enter|⏎|↵).*)?$/i.test(cleanBtnText(btn))) return btn;
     }
     return null;
   }
@@ -840,7 +876,7 @@
     if (!btn) {
       allowRec = { btn: null, sig: '', count: 0, at: 0 };
       const card = document.querySelector('[data-approval-allow]');
-      if (card && now - lastAllowDiagAt > 10000) { // card visible but no "Allow once" (e.g. only "Always allow"): leave a trace without the command text
+      if (card && card.parentElement && now - lastAllowDiagAt > 10000) { // card visible but no matched button: leave a trace without the command text
         lastAllowDiagAt = now;
         diag('allow-nobtn', { btns: [...card.parentElement.querySelectorAll('button')].slice(0, 4).map((b) => cleanBtnText(b).slice(0, 24)).join('|') });
       }
@@ -849,11 +885,12 @@
     const sig = allowSig(btn);
     if (allowRec.btn !== btn || allowRec.sig !== sig || now - allowRec.at > 30000) allowRec = { btn, sig, count: 0, at: 0 };
     if (allowRec.count >= 2 || now - allowRec.at < 3000) return false;
+    const label = cleanBtnText(btn).slice(0, 20);
     allowRec = { btn, sig, count: allowRec.count + 1, at: now };
     lastAutoAllowAt = now;
     diag('auto-allow');
     btn.click();
-    setNote('🤖 Auto-clicked "' + cleanBtnText(btn).slice(0, 20) + '"', 10000);
+    setNote('🤖 Auto-clicked "' + label + '"', 10000);
     renderOverlay();
     return true;
   }
@@ -875,9 +912,10 @@
       active.set('chat', { title: chatTitle, current: true, desc });
     }
     for (const k of [...qMap.keys()]) {
-      if (!active.has(k)) qMap.delete(k);
+      if (!active.has(k)) { qMap.delete(k); closeN('claude-q-' + k); }
     }
-    const fireQ = (key, info) => claimOnce('claude-q-' + key, 5000).then((ok) => {
+    const qTtl = cfg.qRepeatSec ? Math.min(5000, Math.max(500, cfg.qRepeatSec * 500)) : 5000;
+    const fireQ = (key, info) => claimOnce('claude-q-' + key, qTtl).then((ok) => {
       if (!ok) { diag('claim-lost', { c: 'q' }); return; }
       diag('q-alert', { q: key.slice(-12), el: info.desc || '' }); // field must not be `k`: it would overwrite the event name
       if (cfg.qSound) playQuestionBeep();
@@ -910,9 +948,13 @@
     return n;
   }
   function markDone() { if (away()) titleDone = true; }
-  function clearDone() {
+  let lastClearPath = location.pathname;
+  function clearDone(ev) {
     if (away()) return;
     if (!titleDone && !openNs.size && !rowDone.size && !qBlink) return;
+    const pathChanged = location.pathname !== lastClearPath;
+    if (ev && ev.type === 'keydown' && !titleDone && !openNs.size && !qBlink && !pathChanged) return; // avoid scanning sidebar rows on every keystroke while typing
+    lastClearPath = location.pathname;
     closeN();
     document.querySelectorAll('[data-row-key]').forEach((r) => {
       if (r.querySelector('[aria-current="page"]')) rowDone.delete(r.getAttribute('data-row-key'));
@@ -1001,14 +1043,20 @@
       if (e.key === 'claude_overlay_pre_sound_ts') lastPreResetSoundTs = Number(e.newValue) || 0;
       else if (e.key === 'claude_overlay_reset_sound_ts') lastResetSoundTs = Number(e.newValue) || 0;
       else if (e.key === 'claude_overlay_fc_v1') fcAlerted = JSON.parse(e.newValue) || {};
+      else if (e.key === 'claude_overlay_auto_try_again') {
+        state.autoTryAgain = e.newValue !== 'false';
+        renderOverlay();
+      }
+      else if (e.key === 'ide_snooze_until') {
+        renderOverlay();
+      }
       else if (e.key === 'claude_overlay_cfg_v1' && e.newValue) {
         const c = JSON.parse(e.newValue);
         if (c && typeof c === 'object') {
           Object.assign(cfg, c);
           normCfg();
           cfg.minimized = !!cfg.minimized;
-          cfg.autoAllow = !!cfg.autoAllow;
-          if (!['session', 'weekly', 'off'].includes(cfg.titlePct)) cfg.titlePct = 'session';
+          syncPanelInputs();
           applyCfg();
           if (cfg.autoAllow) tryAutoAllow();
           renderOverlay();
@@ -1173,7 +1221,7 @@
   window.__claudeDumpRows = (filter) => { const out = dumpRows(filter, !!filter); console.table(out.map(({ html, ...r }) => r)); return out; };
 
   // 1s tick: pre/post-reset sounds and auto-clicking "Try again"
-  let lastTick = 0;
+  let lastTick = 0, lastCtxScanAt = 0;
   function handleTimersAndAutoClick() {
     const now = Date.now();
     if (lastTick && now - lastTick > 3000) diag('tick-gap', { s: Math.round((now - lastTick) / 1000) }); // timer throttled or tab frozen
@@ -1183,8 +1231,13 @@
     detectResponseDone();
     detectRowsDone();
     repeatDone();
+    if (!document.hidden && now - lastCtxScanAt >= 3000) { // scrape context independently of API polling (so multi-tab sharedFresh never starves it)
+      lastCtxScanAt = now;
+      Object.assign(state, scrapeContextFromDOM());
+    }
     if (statusNoteUntil && now > statusNoteUntil) setNote('');
-    const limitUI = findLimitCardAndTryAgainBtn();
+    const needLimitScan = !state.sessionResetTs || parseInt(state.sessionPct, 10) >= 95 || (state.autoTryAgain && now >= state.sessionResetTs);
+    const limitUI = needLimitScan ? findLimitCardAndTryAgainBtn() : null;
 
     // If a limit card is visible and API reset timestamp is unknown, parse it from card text
     if (limitUI && !state.sessionResetTs) {
@@ -1293,10 +1346,12 @@
     el.classList.toggle('claude-overlay-question', qActive);
 
     if (overlayPointerDown) { pendingRender = true; return; }
+    if (document.hidden && lastRenderHtml) return; // skip DOM rebuild while tab is hidden (re-rendered on visibilitychange)
 
     el.style.minWidth = cfg.minimized ? 'auto' : '220px';
     el.style.padding = cfg.minimized ? '5px 10px' : '10px 14px';
 
+    const muteBadge = snoozed() ? '<span title="Alerts muted (snooze / quiet hours)" style="font-size:11px;">🔕</span>' : '';
     let html = '';
     if (cfg.minimized) {
       const sTxt = state.sessionPct === '?' ? '?' : `${state.sessionPct}%`;
@@ -1307,6 +1362,7 @@
       html = `<div style="display:flex;align-items:center;gap:8px;white-space:nowrap;font-size:11px;">
         ${pill}
         <span style="display:inline-flex;align-items:center;gap:6px;margin-left:auto;">
+          ${muteBadge}
           <button type="button" id="claude-min-btn" title="Expand" aria-label="Expand" style="background:none;border:0;color:inherit;font-family:inherit;line-height:1;cursor:pointer;font-size:13px;font-weight:bold;padding:0 3px;color:#ccc;">+</button>
           <button type="button" id="claude-cfg-btn" title="Settings" aria-label="Settings" style="background:none;border:0;color:inherit;font-family:inherit;line-height:1;cursor:pointer;font-size:13px;font-weight:normal;">⚙</button>
         </span>
@@ -1316,6 +1372,7 @@
         <div style="font-weight:bold;margin-bottom:4px;display:flex;justify-content:space-between;align-items:center;">
           <span style="color:#ff6b6b">⚠️ Claude API Error</span>
           <span style="display:inline-flex;align-items:center;gap:6px;">
+            ${muteBadge}
             <button type="button" id="claude-refresh-btn" title="Refresh now" aria-label="Refresh now" style="background:none;border:0;color:inherit;font-family:inherit;line-height:1;cursor:pointer;font-size:13px;">⟳</button>
             <button type="button" id="claude-min-btn" title="Minimize" aria-label="Minimize" style="background:none;border:0;color:inherit;font-family:inherit;line-height:1;cursor:pointer;font-size:13px;font-weight:bold;padding:0 2px;">–</button>
             <button type="button" id="claude-cfg-btn" title="Settings" aria-label="Settings" style="background:none;border:0;color:inherit;font-family:inherit;line-height:1;cursor:pointer;font-size:13px;font-weight:normal;">⚙</button>
@@ -1341,7 +1398,7 @@
         : '';
 
       const perm = 'Notification' in window ? Notification.permission : 'granted';
-      const permBanner = (cfg.doneNotify && perm !== 'granted')
+      const permBanner = ((cfg.doneNotify || cfg.qNotify) && perm !== 'granted')
         ? `<div style="background:#3a2a1b;color:#ffb74d;border:1px solid #8d5a1e;font-size:10px;padding:3px 6px;border-radius:4px;margin-bottom:6px;text-align:center;">
              🔕 ${perm === 'denied' ? 'notifications blocked (🔒 near URL → Allow)' : 'click here to enable notifications'}
            </div>`
@@ -1373,6 +1430,7 @@
         <div style="font-weight:bold;margin-bottom:6px;display:flex;justify-content:space-between;align-items:center;border-bottom:1px solid #333;padding-bottom:4px;">
           <span>📊 Claude Monitor</span>
           <span style="display:inline-flex;align-items:center;gap:6px;">
+            ${muteBadge}
             <button type="button" id="claude-refresh-btn" title="Refresh now" aria-label="Refresh now" style="background:none;border:0;color:inherit;font-family:inherit;line-height:1;cursor:pointer;font-size:13px;">⟳</button>
             <button type="button" id="claude-min-btn" title="Minimize" aria-label="Minimize" style="background:none;border:0;color:inherit;font-family:inherit;line-height:1;cursor:pointer;font-size:13px;font-weight:bold;padding:0 2px;">–</button>
             <button type="button" id="claude-cfg-btn" title="Settings" aria-label="Settings" style="background:none;border:0;color:inherit;font-family:inherit;line-height:1;cursor:pointer;font-size:13px;font-weight:normal;">⚙</button>
@@ -1425,6 +1483,7 @@
     lastRenderHtml = html;
     const focusId = el.contains(document.activeElement) ? document.activeElement.id : ''; // rebuild must not drop keyboard focus
     el.innerHTML = html;
+    if (el._clampPos) el._clampPos();
     if (focusId) { const fe = document.getElementById(focusId); if (fe) fe.focus(); }
 
     // Bind events for minimize, settings, checkbox, and sound test buttons
@@ -1473,7 +1532,8 @@
     if (testBtn) {
       testBtn.onclick = (e) => {
         e.stopPropagation();
-        playSessionResetBeep();
+        if (!cfg.volume) { setNote('🔇 Alert volume is 0% (⚙)', 4000); renderOverlay(); return; }
+        playSessionResetBeep(true);
       };
     }
   }
@@ -1491,9 +1551,10 @@
       y = Math.max(0, Math.min(y, window.innerHeight - el.offsetHeight));
       Object.assign(el.style, { left: x + 'px', top: y + 'px', right: 'auto', bottom: 'auto' });
     }
+    el._clampPos = () => { if (el.style.left && el.style.left !== 'auto') place(el.offsetLeft, el.offsetTop); };
     try {
       const p = JSON.parse(localStorage.getItem(key));
-      if (p) place(p.x, p.y);
+      if (p && Number.isFinite(p.x) && Number.isFinite(p.y)) place(p.x, p.y);
     } catch (e) {}
 
     let drag = null, moved = false;
@@ -1558,10 +1619,6 @@
           sessionResetTs: state.sessionResetTs,
           weeklyPct: state.weeklyPct,
           weeklyResetTs: state.weeklyResetTs,
-          extraEnabled: state.extraEnabled,
-          extraPct: state.extraPct,
-          extraUsed: state.extraUsed,
-          extraLimit: state.extraLimit,
           lastUpdated: state.lastUpdated,
           orgId: cachedOrgId,
           fetchedAt: now
@@ -1661,10 +1718,15 @@
         loopApi();
       }, Math.max(2, cfg.refreshSec) * 1000);
     })();
-    document.addEventListener('visibilitychange', () => { diag('vis'); if (!document.hidden) { clearDone(); updateAll(); } });
+    document.addEventListener('visibilitychange', () => { diag('vis'); if (!document.hidden) { clearDone(); renderOverlay(); updateAll(); } });
     ['pointerdown', 'keydown', 'focus'].forEach((ev) => window.addEventListener(ev, clearDone, true));
-    // Page itself updates <title> (SPA) — re-apply our prefix
-    try { new MutationObserver(applyTitle).observe(document.head, { childList: true, subtree: true, characterData: true }); } catch (e) {}
+    // Page itself updates <title> (SPA) — re-apply our prefix (ignore <style>/<link> edits in <head>)
+    try {
+      new MutationObserver((recs) => {
+        if (recs.some((m) => m.target.nodeName === 'TITLE' || (m.target.parentNode && m.target.parentNode.nodeName === 'TITLE') ||
+            [...m.addedNodes, ...m.removedNodes].some((n) => n.nodeName === 'TITLE'))) applyTitle();
+      }).observe(document.head, { childList: true, subtree: true, characterData: true });
+    } catch (e) {}
     // Event-driven detection: MutationObserver is not throttled in background tabs (chained setInterval is after ~5 min),
     // and a one-shot setTimeout from its callback is not chained, so the ">=2s idle" confirmation fires on time.
     let detT = 0, mutHid = 0, mutHidAt = 0;
