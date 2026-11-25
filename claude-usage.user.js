@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Claude.ai Usage & Context Overlay (DOM Sync v2.2)
 // @namespace    https://github.com/wojtulab/claude-code-usage
-// @version      2.12.27
+// @version      2.12.28
 // @description  Monitor Claude.ai 1M context and 5h/7d usage limits, sound/browser alerts before & after reset or response completion, and auto-click "Try again".
 // @homepageURL  https://github.com/wojtulab/claude-code-usage
 // @supportURL   https://github.com/wojtulab/claude-code-usage/issues
@@ -37,7 +37,7 @@
   })();
   // end R11 storage shim
 
-  const VERSION = '2.12.27';
+  const VERSION = '2.12.28';
   const TICK_INTERVAL_MS = 1000;             // Countdown, alerts, and button checks every 1s
 
   const lsGet = (k) => { try { return localStorage.getItem(k); } catch (e) { return null; } }; // blocked storage must not stop the script
@@ -60,7 +60,7 @@
     ['sessList', 'Session list in overlay (claude.ai/code)', 'bool', true],
     ['autoAllow', 'Auto-click "Allow once" / "Always allow" (permission)', 'bool', false],
     ['titleInfo', 'Tab title: busy state and %', 'bool', true],
-    ['titlePct', 'Tab title %', 'select', 'session', [['session', 'Session (5h)'], ['weekly', 'Weekly (7d)'], ['off', 'Off']]],
+    ['titlePct', 'Tab title %', 'select', 'adaptive', [['adaptive', 'Adaptive (higher used)'], ['session', 'Session (5h)'], ['weekly', 'Weekly (7d)'], ['off', 'Off']]],
     ['titleBlink', 'Response ready: blink ✅ in title + green icon (silent)', 'bool', true],
     ['startMin', 'Start minimized on page load', 'bool', true],
     ['dockModelBar', 'Dock to model bar (default position)', 'bool', true],
@@ -822,9 +822,9 @@
     return target.getTime();
   }
 
-  // Tab title: "🔄 41% · Claude Code" (busy), "✅3 🔄2 41% · …" (done/busy counters), "❓ …" (question/approval priority), "41% · …" (idle).
-  // % = 5h session usage. Strip prefix before re-applying so page title updates don't loop.
-  const TITLE_PREFIX_RE = /^(?:(?:❓|✅)\d*\s+)?(?:🔄\d*\s+)?(?:\d{1,3}% · )?/;
+  // Tab title: "🔄 41% · Claude Code" (busy), "✅3 🔄2 | 41% · …" (done/busy counters), "❓ …" (question/approval priority), "41% · …" (idle).
+  // % = adaptive (higher used of 5h/7d), 5h, or 7d. Strip prefix before re-applying so page title updates don't loop.
+  const TITLE_PREFIX_RE = /^(?:(?:❓|✅)\d*\s+)?(?:🔄\d*\s+)?(?:\|\s+)?(?:\d{1,3}% · )?/;
   const QUESTION_ATTRS = ['permission', 'approve', 'allow', 'confirm', 'waiting for input', 'waiting-for-input', 'waiting_for_input', 'question'];
   const QUESTION_SEL = ['[data-approval-allow]', ...QUESTION_ATTRS.flatMap((w) => [`[aria-label*="${w}" i]`, `[data-testid*="${w}" i]`])].join(', ');
   const qMap = new Map(); // key → { title, current }
@@ -1033,9 +1033,21 @@
     if (cfg.titleInfo) {
       const busyN = busyCount();
       const busyPart = busyN ? '🔄' + (busyN > 1 ? busyN : '') + ' ' : '';
-      const rawPct = cfg.titlePct === 'weekly' ? state.weeklyPct : (cfg.titlePct === 'off' ? '' : state.sessionPct);
+      let rawPct = '';
+      if (cfg.titlePct === 'adaptive') {
+        const s = /^\d+$/.test(String(state.sessionPct)) ? Number(state.sessionPct) : -1;
+        const w = /^\d+$/.test(String(state.weeklyPct)) ? Number(state.weeklyPct) : -1;
+        const m = Math.max(s, w);
+        if (m >= 0) rawPct = String(m);
+      } else if (cfg.titlePct === 'weekly') {
+        rawPct = state.weeklyPct;
+      } else if (cfg.titlePct !== 'off') {
+        rawPct = state.sessionPct;
+      }
       const pct = /^\d+$/.test(String(rawPct)) ? rawPct + '% · ' : '';
-      next = alertPart + busyPart + pct + base;
+      const prefix = alertPart + busyPart;
+      const sep = pct && /\d\s+$/.test(prefix) ? '| ' : '';
+      next = prefix + sep + pct + base;
     } else {
       next = alertPart + base;
     }
