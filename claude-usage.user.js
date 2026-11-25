@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Claude.ai Usage & Context Overlay (DOM Sync v2.2)
 // @namespace    https://github.com/wojtulab/claude-code-usage
-// @version      2.12.26
+// @version      2.12.27
 // @description  Monitor Claude.ai 1M context and 5h/7d usage limits, sound/browser alerts before & after reset or response completion, and auto-click "Try again".
 // @homepageURL  https://github.com/wojtulab/claude-code-usage
 // @supportURL   https://github.com/wojtulab/claude-code-usage/issues
@@ -37,7 +37,7 @@
   })();
   // end R11 storage shim
 
-  const VERSION = '2.12.26';
+  const VERSION = '2.12.27';
   const TICK_INTERVAL_MS = 1000;             // Countdown, alerts, and button checks every 1s
 
   const lsGet = (k) => { try { return localStorage.getItem(k); } catch (e) { return null; } }; // blocked storage must not stop the script
@@ -158,7 +158,7 @@
       syncPanelInputs();
       applyCfg();
       const o = document.getElementById(OVERLAY_ID);
-      if (o && o._syncPos) o._syncPos();
+      if (o && o._onDockChange) o._onDockChange();
       if (cfg.autoAllow) tryAutoAllow();
       renderOverlay();
     };
@@ -278,7 +278,7 @@
         try { localStorage.setItem('claude_overlay_cfg_v1', JSON.stringify(cfg)); } catch (e) {}
         applyCfg();
         if (k === 'autoAllow' && cfg.autoAllow) tryAutoAllow();
-        if (k === 'dockModelBar' && ov && ov._syncPos) ov._syncPos();
+        if (k === 'dockModelBar' && ov && ov._onDockChange) ov._onDockChange();
         renderOverlay();
       };
       row.append(t, i);
@@ -1613,32 +1613,41 @@
     document.head.appendChild(st);
 
     const defPos = { left: el.style.left, top: el.style.top, right: el.style.right, bottom: el.style.bottom };
-    let hasSavedPos = false, docked = false, drag = null, moved = false;
+    let userDragged = false, docked = false, drag = null, moved = false;
     function place(x, y) {
       x = Math.max(0, Math.min(Math.round(x), Math.max(0, window.innerWidth - el.offsetWidth)));
       y = Math.max(0, Math.min(Math.round(y), Math.max(0, window.innerHeight - el.offsetHeight)));
       if (el.style.left === x + 'px' && el.style.top === y + 'px' && el.style.right === 'auto' && el.style.bottom === 'auto') return;
       Object.assign(el.style, { left: x + 'px', top: y + 'px', right: 'auto', bottom: 'auto' });
     }
+    function loadSavedPos() {
+      try {
+        const p = JSON.parse(localStorage.getItem(key));
+        if (p && Number.isFinite(p.x) && Number.isFinite(p.y)) { place(p.x, p.y); return true; }
+      } catch (e) {}
+      return false;
+    }
     function syncPos() {
-      if (drag || hasSavedPos) return;
+      if (drag || userDragged) return false;
       if (cfg.dockModelBar && anchorFn) {
         const pos = anchorFn(el);
-        if (pos && Number.isFinite(pos.x) && Number.isFinite(pos.y)) { docked = true; place(pos.x, pos.y); return; }
+        if (pos && Number.isFinite(pos.x) && Number.isFinite(pos.y)) { docked = true; place(pos.x, pos.y); return true; }
       }
       if (docked) { docked = false; Object.assign(el.style, defPos); }
+      return false;
     }
     el._syncPos = syncPos;
-    el._resetPos = () => { try { localStorage.removeItem(key); } catch (e) {} hasSavedPos = false; docked = false; Object.assign(el.style, defPos); syncPos(); };
+    el._onDockChange = () => {
+      if (cfg.dockModelBar) { userDragged = false; syncPos(); }
+      else { docked = false; if (!userDragged && !loadSavedPos()) Object.assign(el.style, defPos); }
+    };
+    el._resetPos = () => { try { localStorage.removeItem(key); } catch (e) {} userDragged = false; docked = false; Object.assign(el.style, defPos); syncPos(); };
     el._clampPos = () => {
-      if (!hasSavedPos && docked) { syncPos(); return; }
+      if (cfg.dockModelBar && !userDragged && syncPos()) return;
       if (el.style.left && el.style.left !== 'auto') place(el.offsetLeft, el.offsetTop);
     };
-    try {
-      const p = JSON.parse(localStorage.getItem(key));
-      if (p && Number.isFinite(p.x) && Number.isFinite(p.y)) { hasSavedPos = true; place(p.x, p.y); }
-    } catch (e) {}
-    if (!hasSavedPos) { syncPos(); requestAnimationFrame(syncPos); }
+    if (cfg.dockModelBar) { syncPos(); requestAnimationFrame(syncPos); }
+    else { loadSavedPos(); }
 
     el.addEventListener('pointerdown', (e) => {
       if (e.button !== 0 || e.target.closest('input,label,button,[data-sess],#claude-cfg-btn,#claude-min-btn,#claude-refresh-btn')) return; // pointer capture would swallow clicks
@@ -1655,7 +1664,7 @@
     });
     el.addEventListener('pointerup', () => {
       if (drag && moved) {
-        hasSavedPos = true; docked = false;
+        userDragged = true; docked = false;
         try { localStorage.setItem(key, JSON.stringify({ x: el.offsetLeft, y: el.offsetTop })); } catch (e) {}
       }
       drag = null;
@@ -1664,8 +1673,8 @@
     el.addEventListener('click', (e) => {
       if (moved) { e.stopImmediatePropagation(); moved = false; }
     }, true);
-    window.addEventListener('resize', () => { if (hasSavedPos) { if (el.style.left) place(el.offsetLeft, el.offsetTop); } else syncPos(); });
-    setInterval(() => { if (!document.hidden && !hasSavedPos && cfg.dockModelBar) syncPos(); }, 500);
+    window.addEventListener('resize', () => { if (cfg.dockModelBar && !userDragged) syncPos(); else if (el.style.left && el.style.left !== 'auto') place(el.offsetLeft, el.offsetTop); });
+    setInterval(() => { if (!document.hidden && cfg.dockModelBar && !userDragged) syncPos(); }, 500);
   }
 
   let lastApiAt = 0, updating = false, backoffMs = 0, apiBlockedUntil = 0;
