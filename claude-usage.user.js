@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Claude.ai Usage & Context Overlay (DOM Sync v2.2)
 // @namespace    https://github.com/wojtulab/claude-code-usage
-// @version      2.12.25
+// @version      2.12.26
 // @description  Monitor Claude.ai 1M context and 5h/7d usage limits, sound/browser alerts before & after reset or response completion, and auto-click "Try again".
 // @homepageURL  https://github.com/wojtulab/claude-code-usage
 // @supportURL   https://github.com/wojtulab/claude-code-usage/issues
@@ -37,7 +37,7 @@
   })();
   // end R11 storage shim
 
-  const VERSION = '2.12.25';
+  const VERSION = '2.12.26';
   const TICK_INTERVAL_MS = 1000;             // Countdown, alerts, and button checks every 1s
 
   const lsGet = (k) => { try { return localStorage.getItem(k); } catch (e) { return null; } }; // blocked storage must not stop the script
@@ -62,6 +62,8 @@
     ['titleInfo', 'Tab title: busy state and %', 'bool', true],
     ['titlePct', 'Tab title %', 'select', 'session', [['session', 'Session (5h)'], ['weekly', 'Weekly (7d)'], ['off', 'Off']]],
     ['titleBlink', 'Response ready: blink ✅ in title + green icon (silent)', 'bool', true],
+    ['startMin', 'Start minimized on page load', 'bool', true],
+    ['dockModelBar', 'Dock to model bar (default position)', 'bool', true],
     ['hiddenOnly', 'Notifications only when tab is in background', 'bool', true],
     ['volume', 'Alert volume (%, 0 = silent)', 'num', 100, [0, 100]],
     ['reduceMotion', 'Reduce motion (no pulsing, static blink)', 'bool', false],
@@ -81,7 +83,7 @@
     });
   }
   normCfg();
-  cfg.minimized = !!cfg.minimized;
+  cfg.minimized = cfg.startMin ? true : !!cfg.minimized;
 
   function applyCfg() {
     let st = document.getElementById('claude-usage-overlay-cfgstyle');
@@ -155,6 +157,8 @@
       try { localStorage.setItem(CFG_KEY, JSON.stringify(cfg)); } catch (e) {}
       syncPanelInputs();
       applyCfg();
+      const o = document.getElementById(OVERLAY_ID);
+      if (o && o._syncPos) o._syncPos();
       if (cfg.autoAllow) tryAutoAllow();
       renderOverlay();
     };
@@ -232,11 +236,26 @@
     p.style.cssText = 'position:fixed;z-index:2147483647;background:#1e1e1e;color:#e0e0e0;border:1px solid #777;border-radius:8px;padding:10px 12px;font:12px sans-serif;box-shadow:0 4px 16px rgba(0,0,0,.6);min-width:240px;max-width:calc(100vw - 16px);max-height:calc(100vh - 16px);box-sizing:border-box;overflow-y:auto;';
     const h = document.createElement('div');
     h.textContent = '⚙ Claude Settings';
-    h.style.cssText = 'font-weight:bold;margin-bottom:8px;border-bottom:1px solid #333;padding-bottom:4px;';
+    h.style.cssText = 'font-weight:bold;margin-bottom:6px;border-bottom:1px solid #333;padding-bottom:4px;';
     p.appendChild(h);
+    const fWrap = document.createElement('div');
+    fWrap.style.cssText = 'display:flex;align-items:center;gap:4px;margin-bottom:6px;';
+    const fInp = document.createElement('input');
+    fInp.type = 'search'; fInp.id = 'claude-cfg-filter'; fInp.placeholder = 'Filter settings…';
+    fInp.setAttribute('aria-label', 'Filter settings');
+    fInp.style.cssText = 'flex:1;min-width:0;background:#2d2d2d;color:#e0e0e0;border:1px solid #555;border-radius:4px;padding:3px 6px;font-size:11px;outline:none;';
+    const fCnt = document.createElement('span');
+    fCnt.style.cssText = 'font-size:10px;color:#888;white-space:nowrap;display:none;';
+    const fClr = document.createElement('button');
+    fClr.type = 'button'; fClr.textContent = '×'; fClr.title = 'Clear filter'; fClr.setAttribute('aria-label', 'Clear filter');
+    fClr.style.cssText = 'background:#2d2d2d;color:#bbb;border:1px solid #444;border-radius:4px;padding:1px 6px;font-size:12px;line-height:1.2;cursor:pointer;display:none;';
+    fWrap.append(fInp, fCnt, fClr);
+    p.appendChild(fWrap);
+    const rows = [];
     CFG_SCHEMA.forEach(([k, label, type, def, opts]) => {
       const row = document.createElement('label');
       row.style.cssText = 'display:flex;justify-content:space-between;align-items:center;gap:10px;margin:4px 0;cursor:pointer;';
+      row.dataset.filterText = (k + ' ' + label + (type === 'select' ? ' ' + opts.map((o) => o[0] + ' ' + o[1]).join(' ') : '')).toLowerCase();
       const t = document.createElement('span'); t.textContent = label;
       let i;
       if (type === 'select') {
@@ -259,15 +278,39 @@
         try { localStorage.setItem('claude_overlay_cfg_v1', JSON.stringify(cfg)); } catch (e) {}
         applyCfg();
         if (k === 'autoAllow' && cfg.autoAllow) tryAutoAllow();
+        if (k === 'dockModelBar' && ov && ov._syncPos) ov._syncPos();
         renderOverlay();
       };
       row.append(t, i);
+      rows.push(row);
       p.appendChild(row);
     });
-    p.appendChild(buildDataBox());
-    p.appendChild(buildPresetBox());
-    p.appendChild(buildSnoozeBox());
-    p.appendChild(buildToolsBox());
+    const boxes = [buildDataBox(), buildPresetBox(), buildSnoozeBox(), buildToolsBox()];
+    boxes.forEach((b) => { b.dataset.filterText = (b.textContent || '').toLowerCase(); p.appendChild(b); });
+    const fEmpty = document.createElement('div');
+    fEmpty.textContent = 'No matching settings';
+    fEmpty.style.cssText = 'display:none;color:#888;font-size:11px;padding:6px 0;text-align:center;';
+    p.appendChild(fEmpty);
+    const applyFilter = () => {
+      const terms = fInp.value.trim().toLowerCase().split(/\s+/).filter(Boolean);
+      let shown = 0, boxShown = 0;
+      rows.forEach((row) => {
+        const ok = !terms.length || terms.every((w) => row.dataset.filterText.includes(w));
+        row.style.display = ok ? 'flex' : 'none';
+        if (ok) shown++;
+      });
+      boxes.forEach((b) => {
+        const ok = !terms.length || terms.every((w) => b.dataset.filterText.includes(w));
+        b.style.display = ok ? '' : 'none';
+        if (ok) boxShown++;
+      });
+      fClr.style.display = terms.length ? '' : 'none';
+      fCnt.style.display = terms.length ? '' : 'none';
+      fCnt.textContent = shown + '/' + rows.length;
+      fEmpty.style.display = (terms.length && !shown && !boxShown) ? '' : 'none';
+    };
+    fInp.oninput = applyFilter;
+    fClr.onclick = () => { fInp.value = ''; applyFilter(); fInp.focus(); };
     const x = document.createElement('div');
     x.textContent = 'Refresh/threshold changes apply immediately; settings are stored per browser.';
     x.style.cssText = 'font-size:9px;color:#777;margin-top:6px;';
@@ -300,7 +343,13 @@
     };
     p._close = close;
     p.setAttribute('role', 'dialog'); p.setAttribute('aria-label', 'Claude settings');
-    const onKey = (e) => { if (e.key === 'Escape') { e.stopPropagation(); close(true); } };
+    const onKey = (e) => {
+      if (e.key === 'Escape') {
+        e.stopPropagation();
+        if (fInp.value) { fInp.value = ''; applyFilter(); fInp.focus(); return; }
+        close(true);
+      }
+    };
     const onOutside = (e) => { if (!p.contains(e.target) && !(ov && ov.contains(e.target))) close(); };
     document.addEventListener('keydown', onKey, true);
     document.addEventListener('pointerdown', onOutside, true);
@@ -1538,26 +1587,59 @@
     }
   }
 
-  // Draggable overlay with saved position (opacity is managed by applyCfg)
-  function makeMovable(el, key) {
+  // Anchor default position to the left side of Claude's model selector bar (chin row).
+  function findModelBarPos(el) {
+    let btn = null;
+    for (const cand of document.querySelectorAll('[data-testid="epitaxy-cds-model-selector"], button[data-cds="ModelSelector"]')) {
+      const r = cand.getBoundingClientRect();
+      if (r.width > 0 && r.height > 0 && r.bottom > 0 && r.top < window.innerHeight) { btn = cand; break; }
+    }
+    if (!btn) return null;
+    const br = btn.getBoundingClientRect();
+    const trailing = btn.closest('[data-cds-part="chin-trailing"]');
+    const row = (trailing && trailing.parentElement) || btn.closest('.justify-between') || btn.parentElement;
+    const rr = row ? row.getBoundingClientRect() : null;
+    const oh = el.offsetHeight || 28;
+    const padL = row ? (parseFloat(getComputedStyle(row).paddingLeft) || 0) : 0;
+    const x = (rr && rr.width > br.width + 20) ? (rr.left + padL) : 16;
+    const y = cfg.minimized ? (br.top + (br.height - oh) / 2) : (br.bottom - oh);
+    return { x, y };
+  }
+
+  // Draggable overlay with saved position and optional docking to the model selector bar (opacity is managed by applyCfg)
+  function makeMovable(el, key, anchorFn) {
     const st = document.createElement('style');
     st.textContent = `#${el.id}{touch-action:none}`;
     document.head.appendChild(st);
 
     const defPos = { left: el.style.left, top: el.style.top, right: el.style.right, bottom: el.style.bottom };
-    el._resetPos = () => { try { localStorage.removeItem(key); } catch (e) {} Object.assign(el.style, defPos); };
+    let hasSavedPos = false, docked = false, drag = null, moved = false;
     function place(x, y) {
-      x = Math.max(0, Math.min(x, window.innerWidth - el.offsetWidth));
-      y = Math.max(0, Math.min(y, window.innerHeight - el.offsetHeight));
+      x = Math.max(0, Math.min(Math.round(x), Math.max(0, window.innerWidth - el.offsetWidth)));
+      y = Math.max(0, Math.min(Math.round(y), Math.max(0, window.innerHeight - el.offsetHeight)));
+      if (el.style.left === x + 'px' && el.style.top === y + 'px' && el.style.right === 'auto' && el.style.bottom === 'auto') return;
       Object.assign(el.style, { left: x + 'px', top: y + 'px', right: 'auto', bottom: 'auto' });
     }
-    el._clampPos = () => { if (el.style.left && el.style.left !== 'auto') place(el.offsetLeft, el.offsetTop); };
+    function syncPos() {
+      if (drag || hasSavedPos) return;
+      if (cfg.dockModelBar && anchorFn) {
+        const pos = anchorFn(el);
+        if (pos && Number.isFinite(pos.x) && Number.isFinite(pos.y)) { docked = true; place(pos.x, pos.y); return; }
+      }
+      if (docked) { docked = false; Object.assign(el.style, defPos); }
+    }
+    el._syncPos = syncPos;
+    el._resetPos = () => { try { localStorage.removeItem(key); } catch (e) {} hasSavedPos = false; docked = false; Object.assign(el.style, defPos); syncPos(); };
+    el._clampPos = () => {
+      if (!hasSavedPos && docked) { syncPos(); return; }
+      if (el.style.left && el.style.left !== 'auto') place(el.offsetLeft, el.offsetTop);
+    };
     try {
       const p = JSON.parse(localStorage.getItem(key));
-      if (p && Number.isFinite(p.x) && Number.isFinite(p.y)) place(p.x, p.y);
+      if (p && Number.isFinite(p.x) && Number.isFinite(p.y)) { hasSavedPos = true; place(p.x, p.y); }
     } catch (e) {}
+    if (!hasSavedPos) { syncPos(); requestAnimationFrame(syncPos); }
 
-    let drag = null, moved = false;
     el.addEventListener('pointerdown', (e) => {
       if (e.button !== 0 || e.target.closest('input,label,button,[data-sess],#claude-cfg-btn,#claude-min-btn,#claude-refresh-btn')) return; // pointer capture would swallow clicks
       const r = el.getBoundingClientRect();
@@ -1573,6 +1655,7 @@
     });
     el.addEventListener('pointerup', () => {
       if (drag && moved) {
+        hasSavedPos = true; docked = false;
         try { localStorage.setItem(key, JSON.stringify({ x: el.offsetLeft, y: el.offsetTop })); } catch (e) {}
       }
       drag = null;
@@ -1581,7 +1664,8 @@
     el.addEventListener('click', (e) => {
       if (moved) { e.stopImmediatePropagation(); moved = false; }
     }, true);
-    window.addEventListener('resize', () => { if (el.style.left) place(el.offsetLeft, el.offsetTop); });
+    window.addEventListener('resize', () => { if (hasSavedPos) { if (el.style.left) place(el.offsetLeft, el.offsetTop); } else syncPos(); });
+    setInterval(() => { if (!document.hidden && !hasSavedPos && cfg.dockModelBar) syncPos(); }, 500);
   }
 
   let lastApiAt = 0, updating = false, backoffMs = 0, apiBlockedUntil = 0;
@@ -1705,7 +1789,7 @@
       renderOverlay();
     });
     document.body.appendChild(overlay);
-    makeMovable(overlay, 'claude_overlay_pos_v1');
+    makeMovable(overlay, 'claude_overlay_pos_v1', findModelBarPos);
 
     updateAll();
     applyCfg();
